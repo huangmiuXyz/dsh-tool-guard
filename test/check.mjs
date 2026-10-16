@@ -346,7 +346,8 @@ check(
 )
 // Copy the user asked to remove. Each one is asserted as a NEGATIVE so a later edit
 // cannot quietly bring it back and re-widen the menu.
-check('client: has a trigger label', clientSource.includes("t('trigger')"))
+check('client: no trigger label text', !clientSource.includes("t('trigger')"))
+check('client: the icon-only trigger keeps an accessible name', clientSource.includes("'aria-label': t('title')"))
 check('client: no subtitle line', !clientSource.includes("t('subtitle')"))
 check('client: no not-governed paragraph', !/notGoverned/.test(clientSource))
 check('client: no last-blocked line', !clientSource.includes("t('last'"))

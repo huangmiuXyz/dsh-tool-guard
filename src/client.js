@@ -77,11 +77,17 @@ window.__ModuleLoader__.load({
     // the renderer hands the component a reactive `t`. The navigator-keyed fallback
     // covers a profile without it.
     //
-    // There is no `subtitle` entry: "takes effect now" describes what the switches
-    // DO, and a menu opened to be operated does not need telling on every open.
+    // `title` is the only string the trigger uses, and only as its tooltip and
+    // accessible name: the control is ICON-ONLY. A text label beside the shield
+    // repeated what the tooltip already said and widened the composer row for no
+    // information — and the row is shared with the model selector and permission
+    // chips, so every pixel there is contested.
+    //
+    // There is no `subtitle` entry either: "takes effect now" describes what the
+    // switches DO, and a menu opened to be operated does not need telling on every
+    // open.
     const ZH = {
       title: '工具开关',
-      trigger: '工具开关',
       read: '读操作',
       readHint: '读取文件、搜索、联网查询',
       write: '写操作',
@@ -98,7 +104,6 @@ window.__ModuleLoader__.load({
     }
     const EN = {
       title: 'Tool guard',
-      trigger: 'Tool guard',
       read: 'Reads',
       readHint: 'read files, search, web lookups',
       write: 'Writes',
@@ -210,7 +215,6 @@ window.__ModuleLoader__.load({
    flipped must be visible without opening the menu. Colour plus the icon's fill is
    the signal; no text changes width, so the bar does not reflow on a flip. */
 .dsh-tool-guard-triggerActive { color: var(--dsw-alias-state-warn-primary, var(--dsw-alias-brand-primary)); }
-.dsh-tool-guard-triggerLabel { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dsh-tool-guard-chevron { flex: none; color: var(--dsw-alias-label-caption); transition: transform .12s; }
 .dsh-tool-guard-chevronOpen { transform: rotate(180deg); }
 .dsh-tool-guard-menu {
@@ -692,11 +696,11 @@ window.__ModuleLoader__.load({
                 : 'dsh-tool-guard-trigger',
               'aria-haspopup': 'dialog',
               'aria-expanded': open,
+              'aria-label': t('title'),
               title: t('title'),
               onClick: () => (open ? close() : openMenu())
             },
             h(ShieldIcon, { active: restricted }),
-            h('span', { className: 'dsh-tool-guard-triggerLabel' }, t('trigger')),
             h(ChevronIcon, { open })
           ),
           menu
