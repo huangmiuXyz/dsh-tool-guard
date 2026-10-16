@@ -257,9 +257,27 @@ function readBody(req) {
   })
 }
 
+/**
+ * Wire version of the control route, shared with the client half.
+ *
+ * The two halves are loaded independently: a browser bundle hot-reloads on save,
+ * while this Node-side module keeps running the code it was mounted with until the
+ * process restarts. So a saved edit routinely produces a NEW client talking to an
+ * OLD host.
+ *
+ * Without this marker that mismatch is silent and looks like a bug in the switch:
+ * the client posts `allowRead`, the old host only knows `denyRead`, ignores the
+ * unknown field, and answers with its unchanged state — so the switch springs back
+ * a moment after the click. Numbering the protocol turns that into a stated fact:
+ * a client that does not see its own version says the host is stale and asks for a
+ * restart. Bump this whenever a field is renamed or a switch is added.
+ */
+const PROTOCOL = 3
+
 /** The snapshot the control renders. `blocked`/`last` prove the switch is firing. */
 function snapshot() {
   return {
+    protocol: PROTOCOL,
     allowRead: state.allowRead,
     allowWrite: state.allowWrite,
     allowShell: state.allowShell,
@@ -300,9 +318,24 @@ async function handleState(req, res) {
     sendJson(res, 400, { ok: false, error: 'bad json body' })
     return
   }
-  for (const kind of KINDS) {
+  // A body that names no field this revision knows is not a no-op to shrug off: it
+  // means the caller and this host disagree about the protocol (a hot-reloaded
+  // client against a host that predates the field rename, say). Answering `ok` with
+  // unchanged state is what made that mismatch look like a switch that springs back
+  // on its own, so say so instead.
+  const recognized = KINDS.filter((kind) => typeof payload[SWITCH_FOR[kind]] === 'boolean')
+  if (recognized.length === 0) {
+    sendJson(res, 409, {
+      ok: false,
+      error:
+        `this host speaks tool-guard protocol ${PROTOCOL} and recognized none of the ` +
+        `fields in the request; it is probably running older code than the page — restart DSH`
+    })
+    return
+  }
+  for (const kind of recognized) {
     const field = SWITCH_FOR[kind]
-    if (typeof payload[field] === 'boolean') state[field] = payload[field]
+    state[field] = payload[field]
   }
   sendJson(res, 200, { ok: true, state: snapshot() })
 }
@@ -348,6 +381,7 @@ export function apply(ctx) {
 export {
   HEADER,
   KINDS,
+  PROTOCOL,
   READ_TOOLS,
   ROUTE,
   SHELL_TOOLS,

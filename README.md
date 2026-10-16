@@ -101,17 +101,37 @@ Loader 自己的 entry 走，不给 Loader 行的包，它的浏览器 bundle �
 
 **客户端半边会随 HMR 热更新，宿主半边不会。** 改 `src/client.js` 后刷新页面即可；改
 `src/index.js`（守护逻辑、路由、开关语义）必须重启 DSH 才生效——它是 Node 侧模块，
-Loader 不会重载已挂载的宿主插件。这一点在开发时最容易误判：界面上的开关看起来动了，
-而拦截规则其实还是旧的。
+Loader 不会重载已挂载的宿主插件。
+
+### 版本错配会被明确指出，而不是静默失败
+
+两个半边各自独立加载，所以"存了盘"经常等于"新客户端配旧宿主"。这在早期版本里表现为一个
+很像 bug 的现象：**点击开关后它自己弹回去**。原因是新客户端发 `allowRead`，旧宿主只认
+`denyRead`，对不认识的字段直接忽略，然后回一份没变的状态——客户端的乐观更新撑了 2 秒，
+下一次轮询就把它抹掉了。
+
+现在两边各自声明 `PROTOCOL`：
+
+- 快照里带 `protocol` 字段，客户端发现对不上就**不显示开关**，直接说明"宿主端还是旧版本，
+  请重启 DSH"——而不是给出一个看着能用、点了没用的开关。
+- 宿主端收到一个**一个字段都不认识**的请求时返回 `409`，而不是 `ok`。这是同一个错配的
+  另一个方向。
+- 只有"字段认识但类型不对"才继续静默忽略（比如 `allowWrite: "yes"` 旁边的合法字段照常
+  生效）。
+
+**改动字段名或增删开关时，必须同时把两边的 `PROTOCOL` 加一**，否则这道保护会失声。自检里
+有一条断言专门盯着两边的数字是否一致。
 
 ## 接口
 
 宿主注册一条精确路由 `/dsh-tool-guard/state`：
 
-- `GET` → `{ ok: true, state: { allowRead, allowWrite, allowShell, blocked: { read, write, shell }, last } }`
-- `POST` → 同上，body 里只接受 `allowRead` / `allowWrite` / `allowShell` 三个布尔值，
-  其余字段忽略。必须带 `x-dsh-tool-guard` 请求头——跨源页面可以不带预检地发"简单请求"，
-  要求自定义头才是真正逼出预检、从而让浏览器拦下它的东西。
+- `GET` → `{ ok: true, state: { protocol, allowRead, allowWrite, allowShell, blocked: { read, write, shell }, last } }`
+- `POST` → 同上，body 里只接受 `allowRead` / `allowWrite` / `allowShell` 三个布尔值。
+  必须带 `x-dsh-tool-guard` 请求头——跨源页面可以不带预检地发"简单请求"，要求自定义头
+  才是真正逼出预检、从而让浏览器拦下它的东西。
+- `409` → body 里一个已识别字段都没有，即协议对不上（多半是宿主端落后）。错误信息里带
+  `protocol` 数字和重启提示。
 
 `blocked` / `last` 只出现在快照里，界面不显示。留着是因为它们是"守卫到底有没有在跑"的
 证据，排查时读一次 JSON 比在菜单上加一个计数字段更有用。

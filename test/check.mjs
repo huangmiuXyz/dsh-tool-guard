@@ -66,8 +66,26 @@ check(
 check('client half: registers an id', clientSource.includes("id: 'dsh-tool-guard'"), 'window.__ModuleLoader__.load')
 
 // --- 2. classification --------------------------------------------------------
-const { HEADER, READ_TOOLS, ROUTE, SHELL_TOOLS, WRITE_TOOLS, classify, denyReason, makeGuard, readExtensions } =
+const { HEADER, PROTOCOL, READ_TOOLS, ROUTE, SHELL_TOOLS, WRITE_TOOLS, classify, denyReason, makeGuard, readExtensions } =
   await import(path.join(PKG, 'src', 'index.js'))
+
+// The two halves are loaded independently (the bundle hot-reloads; the host half
+// does not), so their protocol numbers are the ONLY thing keeping a saved edit from
+// silently pairing a new client with a stale host. They must be edited together.
+const clientProtocol = Number(clientSource.match(/^\s*const PROTOCOL = (\d+)/m)?.[1])
+check('protocol: the client half declares it', Number.isInteger(clientProtocol), String(clientProtocol))
+check(
+  'protocol: both halves agree',
+  clientProtocol === PROTOCOL,
+  `client ${clientProtocol} vs host ${PROTOCOL}`
+)
+// A field rename is exactly what a protocol bump accompanies, so assert the
+// renamed fields are the ones the client actually posts.
+check(
+  'protocol: the client posts the fields the host reads',
+  ['allowRead', 'allowWrite', 'allowShell'].every((field) => clientSource.includes(`toggle('${field}')`))
+)
+
 const none = { read: new Set(), write: new Set(), shell: new Set() }
 check('classify: write tool', classify('write', none) === 'write')
 check('classify: edit is a write', classify('edit', none) === 'write')
@@ -318,9 +336,29 @@ try {
     check('live: and bash is restored', host.guards[0](call('bash')) === undefined)
   }
   {
-    const answer = await post({ allowWrite: 'yes' }, true)
+    // A bad-typed field sitting BESIDE a good one: the good one still applies and the
+    // bad one is ignored, because the request as a whole is intelligible.
+    const answer = await post({ allowWrite: 'yes', allowRead: false }, true)
     const payload = await answer.json()
-    check('route: a non-boolean field is ignored, not coerced', payload.state?.allowWrite === true, String(payload.state?.allowWrite))
+    check('route: a bad-typed field is not coerced', payload.state?.allowWrite === true, String(payload.state?.allowWrite))
+    check('route: its good sibling still applies', payload.state?.allowRead === false)
+    await post({ allowRead: true }, true)
+  }
+  {
+    // The mismatch case: a NEW client's field names against an OLD host. Replayed
+    // here by sending only pre-rename field names, which this revision does not
+    // recognize. It must be a loud 409 rather than a silent success — silently
+    // answering `ok` with unchanged state is what made a stale host look like a
+    // switch that springs back on its own.
+    const answer = await post({ denyWrite: true }, true)
+    const payload = await answer.json()
+    check('route: an unrecognized payload is refused', answer.status === 409, String(answer.status))
+    check('route: the refusal names the protocol', String(payload.error).includes('protocol'), String(payload.error))
+    check('route: the refusal tells the user to restart', String(payload.error).includes('restart'), String(payload.error))
+  }
+  {
+    const snapshotPayload = await (await fetch(`${base}${ROUTE}`)).json()
+    check('route: the snapshot advertises its protocol', typeof snapshotPayload.state?.protocol === 'number', String(snapshotPayload.state?.protocol))
   }
   {
     const answer = await fetch(`${base}${ROUTE}`, { method: 'DELETE' })

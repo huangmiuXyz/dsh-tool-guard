@@ -66,6 +66,18 @@ window.__ModuleLoader__.load({
     const ROUTE = '/dsh-tool-guard/state'
     /** Header the Host requires on a write, so a cross-origin POST cannot flip the switch. */
     const HEADER = 'x-dsh-tool-guard'
+    /**
+     * Wire version this bundle speaks; must equal the host half's `PROTOCOL`.
+     *
+     * The two halves reload independently — saving this file hot-swaps the browser
+     * bundle, while `src/index.js` keeps running whatever code the process mounted
+     * with until DSH restarts. A saved edit therefore routinely pairs a NEW client
+     * with an OLD host, and without this check that shows up as a switch that flips
+     * back on its own: the client posts `allowRead`, the old host knows only
+     * `denyRead`, ignores the unknown field and answers with unchanged state.
+     * Comparing versions turns that silent bounce into a stated cause.
+     */
+    const PROTOCOL = 3
     /** Menu geometry: fixed width so the open position can be computed before layout. */
     const MENU_WIDTH = 288
     const MENU_GAP = 6
@@ -100,7 +112,11 @@ window.__ModuleLoader__.load({
       loading: '正在读取状态…',
       failed: '读取失败：',
       retry: '重试',
-      saveFailed: '开关未保存：'
+      saveFailed: '开关未保存：',
+      // Shown when the page and the running host half disagree about the protocol.
+      // Not a transient failure: no amount of retrying fixes it, so the copy names
+      // the one action that does.
+      staleHost: '宿主端还是旧版本，开关改动不会生效。请重启 DSH。'
     }
     const EN = {
       title: 'Tool guard',
@@ -113,7 +129,8 @@ window.__ModuleLoader__.load({
       loading: 'Reading state…',
       failed: 'Could not read state: ',
       retry: 'Retry',
-      saveFailed: 'The switch was not saved: '
+      saveFailed: 'The switch was not saved: ',
+      staleHost: 'The Host half is an older revision, so switch changes cannot take effect. Restart DSH.'
     }
 
     /** The copy for the active language, as a plain dictionary. */
@@ -143,6 +160,9 @@ window.__ModuleLoader__.load({
     }
 
     // --- talking to the host ------------------------------------------------------
+    /** Raised when the Host is running a different revision than this bundle. */
+    class StaleHostError extends Error {}
+
     /**
      * One request to the control route, unwrapped.
      *
@@ -150,6 +170,9 @@ window.__ModuleLoader__.load({
      * is the only useful thing to show — so both paths funnel into one throw.
      * `cache: 'no-store'` is not decoration: the state is polled, and a cached
      * GET would keep showing a switch the user already flipped.
+     *
+     * The protocol check is what keeps a host/bundle version skew from masquerading
+     * as a broken switch. See `PROTOCOL` above for the failure it prevents.
      * @returns the answer's `state` object.
      */
     async function call(ctx, init) {
@@ -161,7 +184,17 @@ window.__ModuleLoader__.load({
         throw new Error(`the Host answered ${response.status} without JSON`)
       }
       if (payload?.ok !== true) {
-        throw new Error(payload?.error ?? `the Host answered ${response.status}`)
+        // A host old enough to predate the protocol field answers the OLD shape
+        // rather than refusing, so the mismatch is detected from the successful
+        // answer below. A 409 from a current host is the other direction of the
+        // same skew, and already carries the restart instruction.
+        throw response.status === 409 ? new StaleHostError(payload?.error) : new Error(payload?.error ?? `the Host answered ${response.status}`)
+      }
+      if (payload.state?.protocol !== PROTOCOL) {
+        throw new StaleHostError(
+          `this page speaks tool-guard protocol ${PROTOCOL} but the Host answered ` +
+            `${payload.state?.protocol ?? 'an older revision'}; restart DSH to load the matching host half`
+        )
       }
       return payload.state
     }
@@ -459,6 +492,9 @@ window.__ModuleLoader__.load({
         const [data, setData] = useState(undefined)
         const [status, setStatus] = useState(undefined)
         const [error, setError] = useState(undefined)
+        // Set only for a host/bundle protocol mismatch; the menu shows the restart
+        // notice instead of the switches, because nothing here can fix it.
+        const [stale, setStale] = useState(undefined)
         // Which switch is mid-write, so only that row goes busy.
         const [pending, setPending] = useState(undefined)
         const [anchor, setAnchor] = useState(undefined)
@@ -492,12 +528,23 @@ window.__ModuleLoader__.load({
               dataRef.current = next
               setData(next)
               setError(undefined)
+              setStale(undefined)
               setStatus('ready')
             })
             .catch((failure) => {
               if (!liveRef.current) return
-              // A failed poll keeps the switch the user can still operate; only the
-              // initial read replaces the menu with the error and its retry.
+              // A version skew is not transient, so it is reported on the first read
+              // AND every poll — otherwise a stale host would show its stale switches
+              // as if they were simply the truth. Retrying cannot help, so it also
+              // drops the switches rather than leaving them operable but inert.
+              if (failure instanceof StaleHostError) {
+                setStale(String(failure.message))
+                setData(undefined)
+                setStatus('error')
+                return
+              }
+              // Any other failed poll keeps the switch the user can still operate; only
+              // the initial read replaces the menu with the error and its retry.
               if (quiet && dataRef.current !== undefined) return
               setError(String(failure?.message ?? failure))
               setStatus('error')
@@ -540,10 +587,20 @@ window.__ModuleLoader__.load({
                 dataRef.current = next
                 setData(next)
                 setError(undefined)
+                setStale(undefined)
               })
               .catch((failure) => {
                 if (!liveRef.current) return
                 setData((prev) => (prev === undefined ? prev : { ...prev, [field]: current }))
+                // A stale host is the one failure the user must act on, and it explains
+                // the exact symptom they just saw (the switch bouncing back), so it
+                // replaces the row instead of sitting under it as a footnote.
+                if (failure instanceof StaleHostError) {
+                  setStale(String(failure.message))
+                  setData(undefined)
+                  setStatus('error')
+                  return
+                }
                 setError(`${t('saveFailed')}${String(failure?.message ?? failure)}`)
               })
               .finally(() => {
@@ -616,61 +673,77 @@ window.__ModuleLoader__.load({
                     { className: 'dsh-tool-guard-header' },
                     h('div', { className: 'dsh-tool-guard-title' }, t('title'))
                   ),
-                  h(GuardRow, {
-                    icon: h(EyeIcon, null),
-                    title: t('read'),
-                    hint: t('readHint'),
-                    checked: readOn,
-                    busy: pending === 'allowRead',
-                    onToggle: () => toggle('allowRead'),
-                    t
-                  }),
-                  h(GuardRow, {
-                    icon: h(PencilIcon, null),
-                    title: t('write'),
-                    hint: t('writeHint'),
-                    checked: writeOn,
-                    busy: pending === 'allowWrite',
-                    onToggle: () => toggle('allowWrite'),
-                    t
-                  }),
-                  h(GuardRow, {
-                    icon: h(TerminalIcon, null),
-                    title: t('shell'),
-                    hint: t('shellHint'),
-                    checked: shellOn,
-                    busy: pending === 'allowShell',
-                    onToggle: () => toggle('allowShell'),
-                    t
-                  }),
-                  // Only failures and the first read get a line here. The per-row
-                  // counts above already prove the switch is firing, and a
-                  // "last blocked: <tool>" line said the same thing a second time
-                  // while pushing the switches up the menu.
-                  status === 'error'
+                  // A protocol mismatch hides the switches entirely rather than showing
+                  // them as inert. An operable-looking switch that cannot take effect is
+                  // exactly the trap this notice exists to end: the user clicks, the row
+                  // springs back, and nothing on screen says why.
+                  stale !== undefined
                     ? h(
                         'div',
                         { className: 'dsh-tool-guard-status' },
-                        h('span', { className: 'dsh-tool-guard-error' }, `${t('failed')}${error}`)
+                        h('span', { className: 'dsh-tool-guard-error' }, t('staleHost')),
+                        h('span', { className: 'dsh-tool-guard-hint' }, stale)
                       )
-                    : status === 'loading' || status === undefined
-                      ? h(
-                          'div',
-                          { className: 'dsh-tool-guard-status' },
-                          h('span', { className: 'dsh-tool-guard-note' }, t('loading'))
-                        )
-                      : null,
-                  status === 'error'
-                    ? h(
-                        'button',
-                        {
-                          type: 'button',
-                          className: 'dsh-tool-guard-retry',
-                          onClick: () => load()
-                        },
-                        t('retry')
-                      )
-                    : null
+                    : [
+                        h(GuardRow, {
+                          key: 'read',
+                          icon: h(EyeIcon, null),
+                          title: t('read'),
+                          hint: t('readHint'),
+                          checked: readOn,
+                          busy: pending === 'allowRead',
+                          onToggle: () => toggle('allowRead')
+                        }),
+                        h(GuardRow, {
+                          key: 'write',
+                          icon: h(PencilIcon, null),
+                          title: t('write'),
+                          hint: t('writeHint'),
+                          checked: writeOn,
+                          busy: pending === 'allowWrite',
+                          onToggle: () => toggle('allowWrite')
+                        }),
+                        h(GuardRow, {
+                          key: 'shell',
+                          icon: h(TerminalIcon, null),
+                          title: t('shell'),
+                          hint: t('shellHint'),
+                          checked: shellOn,
+                          busy: pending === 'allowShell',
+                          onToggle: () => toggle('allowShell')
+                        }),
+                        // Only a failure or the first read gets a line here. The
+                        // switches say what the state is, so a summary line repeating
+                        // them would just push them down the menu.
+                        status === 'error'
+                          ? h(
+                              'div',
+                              { key: 'error', className: 'dsh-tool-guard-status' },
+                              h('span', { className: 'dsh-tool-guard-error' }, `${t('failed')}${error}`)
+                            )
+                          : status === 'loading' || status === undefined
+                            ? h(
+                                'div',
+                                { key: 'loading', className: 'dsh-tool-guard-status' },
+                                h('span', { className: 'dsh-tool-guard-note' }, t('loading'))
+                              )
+                            : null,
+                        // No retry button when the host is stale: the request would
+                        // succeed and answer the same stale shape, so offering it would
+                        // invite a loop that cannot terminate.
+                        status === 'error' && stale === undefined
+                          ? h(
+                              'button',
+                              {
+                                key: 'retry',
+                                type: 'button',
+                                className: 'dsh-tool-guard-retry',
+                                onClick: () => load()
+                              },
+                              t('retry')
+                            )
+                          : null
+                      ]
                 ),
                 document.body
               )
