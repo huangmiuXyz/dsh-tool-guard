@@ -1,0 +1,9 @@
+# dsh bundle patch: inserts this plugin into a profile's layer stack.
+#
+# Both rows matter. The host row registers the live guard and the control route;
+# the client row is the only reason `exports["./client"]` is ever scanned — a
+# package that contributes no Loader row is never walked by
+# `@deepseek-ai/dsh-client-modules`, so its browser bundle is never served.
+- insert:
+    - id: tool-guard
+      name: 'dsh-tool-guard'

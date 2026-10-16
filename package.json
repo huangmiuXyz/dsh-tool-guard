@@ -1,0 +1,54 @@
+{
+  "name": "dsh-tool-guard",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Live read/write/shell kill-switch for agent tools: flip a switch on the composer bar and the next tool call of that kind is refused, returning \"此操作已被用户实时禁用\" to the model instead. · 会话中实时禁用读操作、写操作或命令行：在输入框工具条上一键开关，下一次该类工具调用即被拦截并回执「此操作已被用户实时禁用」。",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/huangmiuXyz/dsh-tool-guard.git"
+  },
+  "homepage": "https://github.com/huangmiuXyz/dsh-tool-guard#readme",
+  "bugs": {
+    "url": "https://github.com/huangmiuXyz/dsh-tool-guard/issues"
+  },
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "guard",
+    "read-only",
+    "deny",
+    "tool",
+    "shell",
+    "composer"
+  ],
+  "main": "src/index.js",
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./src/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "test": "node test/check.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-locale"
+      ]
+    }
+  }
+}
