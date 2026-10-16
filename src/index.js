@@ -109,30 +109,47 @@ const WRITE_TOOLS = new Set([
 ])
 
 /**
- * Tools that delegate to or drive ANOTHER agent, and so are refused while the
- * agent switch is off.
+ * Tools that touch ANOTHER agent — creating one, driving one, or observing the
+ * ones this session started — and so are refused while the agent switch is off.
  *
- * This covers the delegation tools themselves — `subagent`, `subagent_fork`, and
+ * This covers the delegation tools themselves: `subagent`, `subagent_fork`, and
  * `workflow`, whose `agent()` hook spawns children in a loop. Blocking here is
  * different in kind from the other three switches: those gate what THIS session
  * does, while this one gates whether the session may act through anyone else.
  *
- * `send_message` is here rather than under writes, where it used to live. It
- * performs no file or system change; what it does is hand work to another agent,
- * which is exactly this kind. Keeping it under writes would mean a user who turned
- * off "delegation" could still drive existing children — the switch would leak.
+ * `send_message`, `list_agents`, and `interrupt_agent` are here rather than under
+ * writes and reads, where the first two used to live. All of them are about
+ * subagents and nothing else: one hands work to another agent, one reports the
+ * agents this session started, one stops one of them. Filing them by their
+ * mechanics (a message is not a file write; a listing is not a file read; a stop is
+ * not a shell command) split the subagent surface across three switches, so a user
+ * who turned delegation off could still enumerate, drive, and stop children. The
+ * question this switch answers is "may this session deal with other agents", and
+ * every tool that touches one answers to it.
  *
- * `interrupt_agent` is deliberately NOT governed, anywhere. It stops work, so
- * blocking it removes the user's own ability to wind a runaway delegation down,
- * protects nothing, and is precisely the wrong thing to disable during the
- * incident this plugin exists for.
+ * ON `interrupt_agent`, WHICH IS THE ONE THAT COSTS SOMETHING: blocking it removes
+ * the obvious way to wind a runaway delegation down. It is grouped here anyway,
+ * because the classification rule is "which agent does this act on", not "would
+ * blocking it be inconvenient" — a switch that quietly exempts the tools it would
+ * be awkward to block is a switch whose boundary cannot be stated, and this menu
+ * tells the user exactly which tools each row covers. The escape hatch is the
+ * switch itself: turn it back on, then stop the child. That is one gesture, it is
+ * visible on the same control, and unlike an exemption it leaves nothing hidden.
  *
  * Children themselves are governed by the ordinary switches through inheritance:
  * a restricted session's subagents resolve to the same policy, so they cannot
  * write or run commands just because they were handed the task. This switch is
- * about CREATING and DRIVING them, which inheritance alone cannot express.
+ * about CREATING, DRIVING, SEEING, and STOPPING them, which inheritance alone
+ * cannot express.
  */
-const AGENT_TOOLS = new Set(['subagent', 'subagent_fork', 'workflow', 'send_message'])
+const AGENT_TOOLS = new Set([
+  'subagent',
+  'subagent_fork',
+  'workflow',
+  'send_message',
+  'list_agents',
+  'interrupt_agent'
+])
 
 /**
  * Tools that run an arbitrary command, and so are refused while the shell is off.
@@ -165,7 +182,6 @@ const READ_TOOLS = new Set([
   'read_image',
   'web_search',
   'web_fetch',
-  'list_agents',
   'job_output',
   'job_list',
   'get_goal',

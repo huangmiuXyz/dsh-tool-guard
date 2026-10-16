@@ -121,10 +121,12 @@ check('classify: workflow is a delegation tool', classify('workflow', none) === 
 // send_message MOVED out of writes: it performs no file change, and leaving it under
 // writes would let a user who disabled delegation keep driving existing children.
 check('classify: send_message is delegation, not a write', classify('send_message', none) === 'agent')
-// Stopping work must stay available: blocking interrupt_agent would remove the user's
-// own way to wind a runaway delegation down, which is the wrong thing to disable.
-check('classify: interrupt_agent is ungoverned', classify('interrupt_agent', none) === undefined)
-check('classify: list_agents stays a read', classify('list_agents', none) === 'read')
+// Every tool that touches another agent answers to the SAME switch, whatever its
+// mechanics. list_agents used to sit under reads and interrupt_agent under nothing,
+// which split the subagent surface across three switches: a user who turned
+// delegation off could still enumerate and stop children.
+check('classify: list_agents is delegation, not a read', classify('list_agents', none) === 'agent')
+check('classify: interrupt_agent is delegation', classify('interrupt_agent', none) === 'agent')
 check('classify: todo_write is ungoverned', classify('todo_write', none) === undefined)
 check('classify: unknown tool is ungoverned', classify('mcp__foo__bar', none) === undefined)
 // An extension outranks the built-in table, so a name can be MOVED between kinds
@@ -440,7 +442,10 @@ try {
     // A fresh load must change NOTHING: every switch on, i.e. every kind allowed.
     check(
       'route: GET starts with every kind allowed',
-      payload.state?.allowRead === true && payload.state?.allowWrite === true && payload.state?.allowShell === true
+      payload.state?.allowRead === true &&
+        payload.state?.allowWrite === true &&
+        payload.state?.allowShell === true &&
+        payload.state?.allowAgent === true
     )
     check('route: the snapshot advertises its protocol', payload.state?.protocol === PROTOCOL, String(payload.state?.protocol))
     check('route: the snapshot names the session', payload.state?.sessionId === 'root-a')
@@ -509,10 +514,46 @@ try {
     check('live: and the file tools are still allowed', guard(call('write', 'root-a')) === undefined)
   }
   {
+    // The subagent switch, end to end. Every tool that touches another agent answers
+    // to it — spawning, driving, enumerating, and stopping — so turning delegation
+    // off cannot be worked around by using a different verb on the same children.
+    const payload = await (
+      await post({ sessionId: 'root-a', allowRead: true, allowShell: true, allowAgent: false })
+    ).json()
+    check('route: the subagent switch is settable', payload.state?.allowAgent === false)
+    const guard = host.guards[0]
+    check('live: subagents deny subagent', typeof guard(call('subagent', 'root-a')) === 'string')
+    check('live: subagents deny subagent_fork', typeof guard(call('subagent_fork', 'root-a')) === 'string')
+    check('live: subagents deny workflow', typeof guard(call('workflow', 'root-a')) === 'string')
+    check('live: subagents deny send_message', typeof guard(call('send_message', 'root-a')) === 'string')
+    check('live: subagents deny list_agents', typeof guard(call('list_agents', 'root-a')) === 'string')
+    check('live: subagents deny interrupt_agent', typeof guard(call('interrupt_agent', 'root-a')) === 'string')
+    check('live: the other session may still delegate', guard(call('subagent', 'root-b')) === undefined)
+    check('live: and this session may still read', guard(call('read', 'root-a')) === undefined)
+    check('live: and this session may still write', guard(call('write', 'root-a')) === undefined)
+    // Inheritance reaches it: a child of a subagent-off session cannot delegate
+    // either, so going one step out is not a way around the switch.
+    check('live: the child inherits the subagent ban', typeof guard(call('subagent', 'child-a')) === 'string')
+    const childSnapshot = await (await get('child-a')).json()
+    check('route: the inherited ban is reported', childSnapshot.state?.allowAgent === false)
+    await post({ sessionId: 'root-a', allowAgent: true })
+    check('live: releasing subagents releases the child', guard(call('subagent', 'child-a')) === undefined)
+  }
+  {
+    // Counters are per session and per kind, and they must survive the round trip.
+    // Re-established here rather than inherited from an earlier block: dropping a
+    // policy drops its counters too (that is asserted just below), so this block has
+    // to create the state it measures.
+    await post({ sessionId: 'root-a', allowRead: false, allowShell: false })
+    const guard = host.guards[0]
+    guard(call('read', 'root-a'))
+    guard(call('bash', 'root-a'))
+    guard(call('read', 'root-a'))
     const payload = await (await get('root-a')).json()
     check('route: the counters survive the round trip', payload.state?.blocked?.shell === 1, String(payload.state?.blocked?.shell))
-    check('route: and are counted per kind', payload.state?.blocked?.read === 1, String(payload.state?.blocked?.read))
+    check('route: and are counted per kind', payload.state?.blocked?.read === 2, String(payload.state?.blocked?.read))
     check('route: the last denial names its tool', payload.state?.last?.tool === 'read')
+    check('route: an untouched kind stays at zero', payload.state?.blocked?.write === 0, String(payload.state?.blocked?.write))
   }
   {
     // Restoring every kind drops the entry entirely, so a session returns to "no

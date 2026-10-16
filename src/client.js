@@ -117,7 +117,7 @@ window.__ModuleLoader__.load({
       // The delegation switch. Named for what it stops rather than for the tool, so a
       // user who has never read the tool list can still tell what it does.
       agent: '子智能体',
-      agentHint: '调用 subagent / workflow，或给已有子会话派活',
+      agentHint: '创建、查看、派活、停止',
       loading: '正在读取状态…',
       failed: '读取失败：',
       retry: '重试',
@@ -141,7 +141,7 @@ window.__ModuleLoader__.load({
       shell: 'Shell',
       shellHint: 'run commands — can also write files',
       agent: 'Subagents',
-      agentHint: 'call subagent / workflow, or send work to an existing child',
+      agentHint: 'create, list, or stop subagents',
       loading: 'Reading state…',
       failed: 'Could not read state: ',
       retry: 'Retry',

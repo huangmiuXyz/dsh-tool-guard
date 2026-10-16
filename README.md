@@ -33,11 +33,11 @@ continue with what the user allows, or tell the user what you need.
 
 | 开关 | 关掉后拦住的工具 |
 | --- | --- |
-| **读操作** | `read` `glob` `grep` `read_image` `web_search` `web_fetch` `list_agents` `job_output` `job_list` `get_goal` `skill` `cordis_inspect_*` `load_workspace_dependencies` |
+| **读操作** | `read` `glob` `grep` `read_image` `web_search` `web_fetch` `job_output` `job_list` `get_goal` `skill` `cordis_inspect_*` `load_workspace_dependencies` |
 | **写操作** | `write` `edit` `plugin_manager` `present` `import_chat` |
 | **命令行** | `bash` `pwsh` |
-| **子智能体** | `subagent` `subagent_fork` `workflow` `send_message` |
-| **不归管** | 其余一切，包括 `todo_write`、`create_goal`、`interrupt_agent`、`list_agents`、以及 MCP 与第三方插件的工具 |
+| **子智能体** | `subagent` `subagent_fork` `workflow` `send_message` `list_agents` `interrupt_agent` |
+| **不归管** | 其余一切，包括 `todo_write`、`create_goal`、以及 MCP 与第三方插件的工具 |
 
 ### 命令行为什么单独一个开关
 
@@ -53,19 +53,26 @@ continue with what the user allows, or tell the user what you need.
 ### 子智能体为什么单独一个开关
 
 因为它拦的是**另一种问题**。前三个开关管"这个会话自己做什么"；这一个管"这个会话能不能
-**通过别人**做事"——调用 `subagent` / `subagent_fork` / `workflow` 去支使另一个 agent。
+**通过别人**做事"——创建子 agent、给它派活、看它、停它。
 
 继承**不能**替代它。继承决定的是"子 agent 一旦存在，允许它做什么"；而这个开关决定的是
 "能不能创建或驱动它"。两者都要：关掉子智能体开关之后，委派这件事本身就是关的，而不是
 "委派出去了但干不了活"。
 
-`send_message` 也归这一类，**从写操作移了过来**。它不改任何文件，做的是把活交给另一个
-agent——如果留在写操作里，一个关掉了"委派"的用户仍然能支使已经存在的子会话，开关就漏了。
+**归类规则是"这个工具作用于哪个 agent"，不是"拦住了方不方便"。** 所以下面几个都归在这里，
+尽管从机制上看它们更像别的类：
 
-**`interrupt_agent` 一律不归管**：它是停止工作的，拦住它等于拿掉用户自己给失控委派收尾的
-手段，什么都保护不了，而且恰恰是这个插件存在的场景里最不该禁的东西。
+- `send_message`（原本在写操作）——不改任何文件，做的是把活交给另一个 agent
+- `list_agents`（原本在读操作）——只列本会话起的子 agent，读的是 agent 而不是文件
+- `interrupt_agent`——停止一个子 agent
 
-`list_agents` 仍是读操作（纯观察）。
+前两个如果留在原处，一个关掉了"委派"的用户仍然能**枚举和支使**已经存在的子会话，开关就
+从它本该覆盖的那些工具漏出去了。
+
+**`interrupt_agent` 是这几个里唯一有代价的**：拦住它就少了给失控委派收尾的顺手手段。它仍然
+归在这里，因为规则是"作用于谁"而不是"拦了会不会不方便"——一个悄悄豁免掉"拦着麻烦"的工具
+的开关，边界就没法说清，而这个菜单恰恰是逐行列明覆盖范围的。逃生口就是开关本身：把它打开，
+再去停。一个手势，就在同一个控件上，而且不像豁免那样藏着东西。
 
 ### 其余取舍
 
