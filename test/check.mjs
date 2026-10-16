@@ -70,6 +70,7 @@ check('client half: registers an id', clientSource.includes("id: 'dsh-tool-guard
 
 // --- 2. classification --------------------------------------------------------
 const {
+  AGENT_TOOLS,
   ALLOWED,
   HEADER,
   PROTOCOL,
@@ -99,7 +100,7 @@ check(
   ['allowRead', 'allowWrite', 'allowShell'].every((field) => clientSource.includes(`toggle('${field}')`))
 )
 
-const none = { read: new Set(), write: new Set(), shell: new Set() }
+const none = { read: new Set(), write: new Set(), shell: new Set(), agent: new Set() }
 check('classify: write tool', classify('write', none) === 'write')
 check('classify: edit is a write', classify('edit', none) === 'write')
 // bash is its OWN kind, separate from writes: a shell is a superset of the write
@@ -112,17 +113,33 @@ check('classify: web_fetch is a read', classify('web_fetch', none) === 'read')
 // Session bookkeeping is deliberately ungoverned: blocking it would interrupt work
 // without protecting anything on disk.
 check('classify: todo_write is ungoverned', classify('todo_write', none) === undefined)
+// Delegation tools are their own kind: they change no file, and they gate whether
+// this session may act THROUGH another agent — a question the other kinds cannot ask.
+check('classify: subagent is a delegation tool', classify('subagent', none) === 'agent')
+check('classify: subagent_fork is a delegation tool', classify('subagent_fork', none) === 'agent')
+check('classify: workflow is a delegation tool', classify('workflow', none) === 'agent')
+// send_message MOVED out of writes: it performs no file change, and leaving it under
+// writes would let a user who disabled delegation keep driving existing children.
+check('classify: send_message is delegation, not a write', classify('send_message', none) === 'agent')
+// Stopping work must stay available: blocking interrupt_agent would remove the user's
+// own way to wind a runaway delegation down, which is the wrong thing to disable.
+check('classify: interrupt_agent is ungoverned', classify('interrupt_agent', none) === undefined)
+check('classify: list_agents stays a read', classify('list_agents', none) === 'read')
+check('classify: todo_write is ungoverned', classify('todo_write', none) === undefined)
 check('classify: unknown tool is ungoverned', classify('mcp__foo__bar', none) === undefined)
 // An extension outranks the built-in table, so a name can be MOVED between kinds
 // rather than being unreachable behind the built-in entry.
-const moved = { read: new Set(['bash']), write: new Set(), shell: new Set() }
+const moved = { read: new Set(['bash']), write: new Set(), shell: new Set(), agent: new Set() }
 check('classify: extension moves bash to reads', classify('bash', moved) === 'read')
-const added = { read: new Set(), write: new Set(['mcp__fs__write']), shell: new Set() }
+const added = { read: new Set(), write: new Set(['mcp__fs__write']), shell: new Set(), agent: new Set() }
 check('classify: extension adds an unknown tool', classify('mcp__fs__write', added) === 'write')
-check('classify: all three built-in lists non-empty', WRITE_TOOLS.size > 0 && READ_TOOLS.size > 0 && SHELL_TOOLS.size > 0)
+check(
+  'classify: all four built-in lists non-empty',
+  WRITE_TOOLS.size > 0 && READ_TOOLS.size > 0 && SHELL_TOOLS.size > 0 && AGENT_TOOLS.size > 0
+)
 // A name in two built-in lists would be governed by whichever set is consulted
 // first, which is an invisible change of meaning — so the lists must stay disjoint.
-const allLists = { read: READ_TOOLS, write: WRITE_TOOLS, shell: SHELL_TOOLS }
+const allLists = { read: READ_TOOLS, write: WRITE_TOOLS, shell: SHELL_TOOLS, agent: AGENT_TOOLS }
 const names = Object.keys(allLists)
 const overlaps = []
 for (const left of names) {
@@ -141,7 +158,8 @@ const record = (patch = {}) => ({
   allowRead: true,
   allowWrite: true,
   allowShell: true,
-  blocked: { read: 0, write: 0, shell: 0 },
+  allowAgent: true,
+  blocked: { read: 0, write: 0, shell: 0, agent: 0 },
   last: undefined,
   ...patch
 })
@@ -171,12 +189,22 @@ const call = (name, sessionId) => ({
     'guard: records the last denial with its session',
     table.get('s1').last?.tool === 'write' && table.get('s1').last?.sessionId === 's1'
   )
-  // The whole point of three switches: denying writes must NOT touch the shell, and
+  // The whole point of separate switches: denying writes must NOT touch the shell, and
   // denying the shell must not touch writes.
   check('guard: denying writes leaves the shell alone', guard(call('bash', 's1')) === undefined)
   table.set('s1', record({ allowWrite: false, allowShell: false }))
   check('guard: the shell is denied by its own switch', typeof guard(call('bash', 's1')) === 'string')
   check('guard: the shell denial says 命令行', guard(call('bash', 's1')).includes('命令行'))
+  // Delegation is its own kind: a denied shell must not follow through to it, and a
+  // denied delegation must not touch the shell.
+  check('guard: denying the shell leaves delegation alone', guard(call('subagent', 's1')) === undefined)
+  table.set('s1', record({ allowAgent: false }))
+  const agentReason = guard(call('subagent', 's1'))
+  check('guard: delegation is denied by its own switch', typeof agentReason === 'string')
+  check('guard: the delegation denial says 子智能体调用', agentReason.includes('子智能体调用'), agentReason)
+  check('guard: denying delegation leaves the shell alone', guard(call('bash', 's1')) === undefined)
+  check('guard: denying delegation leaves writes alone', guard(call('write', 's1')) === undefined)
+  check('guard: the delegation counter is its own', table.get('s1').blocked.agent === 1, String(table.get('s1').blocked.agent))
   table.set('s1', record({ allowShell: false }))
   check('guard: allows again as soon as the switch is back on', guard(call('write', 's1')) === undefined)
 }
@@ -196,6 +224,10 @@ const call = (name, sessionId) => ({
   )
   table.set('s1', record())
   check('scope: releasing one session does not release the other', typeof guard(call('read', 's2')) === 'string')
+  // Delegation is scoped like everything else.
+  table.set('s1', record({ allowAgent: false }))
+  check('scope: delegation is denied in the restricted session', typeof guard(call('subagent', 's1')) === 'string')
+  check('scope: and still allowed in the other', guard(call('subagent', 's2')) === undefined)
 }
 
 {
@@ -237,7 +269,7 @@ const call = (name, sessionId) => ({
 {
   // A call with no agent has no session to carry a policy, so it is out of scope
   // rather than implicitly denied.
-  const table = freshPolicies({ root: { allowRead: false, allowWrite: false, allowShell: false } })
+  const table = freshPolicies({ root: { allowRead: false, allowWrite: false, allowShell: false, allowAgent: false } })
   const guard = makeGuard(table, freshTree(), none)
   check('scope: an agentless call is not governed', guard(call('write', undefined)) === undefined)
   check('scope: an agentless call records nothing', table.get('root').blocked.write === 0)
@@ -258,10 +290,11 @@ const call = (name, sessionId) => ({
 
 {
   // Unreadable policy objects must fail CLOSED: only an exact `true` permits.
-  const table = new Map([['root', { blocked: { read: 0, write: 0, shell: 0 } }]])
+  const table = new Map([['root', { blocked: { read: 0, write: 0, shell: 0, agent: 0 } }]])
   const guard = makeGuard(table, freshTree(), none)
   check('safety: an absent allowWrite fails closed', typeof guard(call('write', 'root')) === 'string')
   check('safety: an absent allowRead fails closed', typeof guard(call('read', 'root')) === 'string')
+  check('safety: an absent allowAgent fails closed', typeof guard(call('subagent', 'root')) === 'string')
 }
 
 // --- 4. extensions ------------------------------------------------------------
@@ -269,7 +302,8 @@ const call = (name, sessionId) => ({
   const extensions = readExtensions({
     DSH_TOOL_GUARD_WRITE: ' mcp__fs__write , mcp__fs__remove ',
     DSH_TOOL_GUARD_READ: 'mcp__fs__read',
-    DSH_TOOL_GUARD_SHELL: 'mcp__exec__run'
+    DSH_TOOL_GUARD_SHELL: 'mcp__exec__run',
+    DSH_TOOL_GUARD_AGENT: 'mcp__orchestrate__spawn'
   })
   check(
     'env: write names parsed and trimmed',
@@ -277,14 +311,23 @@ const call = (name, sessionId) => ({
   )
   check('env: read names parsed', extensions.read.has('mcp__fs__read'))
   check('env: shell names parsed', extensions.shell.has('mcp__exec__run'))
+  check('env: agent names parsed', extensions.agent.has('mcp__orchestrate__spawn'))
   const empty = readExtensions(undefined)
-  check('env: absent vars yield empty sets', empty.write.size === 0 && empty.read.size === 0 && empty.shell.size === 0)
+  check(
+    'env: absent vars yield empty sets',
+    empty.write.size === 0 && empty.read.size === 0 && empty.shell.size === 0 && empty.agent.size === 0
+  )
   const table = freshPolicies({ root: { allowWrite: false } })
   check('env: an extended write tool is denied', typeof makeGuard(table, freshTree(), extensions)(call('mcp__fs__write', 'root')) === 'string')
   const shellTable = freshPolicies({ root: { allowShell: false } })
   check(
     'env: an extended shell tool is denied',
     typeof makeGuard(shellTable, freshTree(), extensions)(call('mcp__exec__run', 'root')) === 'string'
+  )
+  const agentTable = freshPolicies({ root: { allowAgent: false } })
+  check(
+    'env: an extended delegation tool is denied',
+    typeof makeGuard(agentTable, freshTree(), extensions)(call('mcp__orchestrate__spawn', 'root')) === 'string'
   )
 }
 
@@ -532,6 +575,7 @@ try {
   check('snapshot: flags inheritance', snap.inherited === true)
   check('snapshot: carries the protocol', snap.protocol === PROTOCOL)
   check('snapshot: an unrestricted session reports the default', snapshot('free').allowWrite === ALLOWED.allowWrite)
+  check('snapshot: carries the agent switch', snapshot('free').allowAgent === true)
   policies.clear()
   parents.clear()
 }
@@ -547,8 +591,8 @@ check('client: reads state with GET', clientSource.includes("method: 'GET'"))
 check('client: writes state with POST', clientSource.includes("method: 'POST'"))
 check('client: sends the required header', clientSource.includes('[HEADER]:'), HEADER)
 check(
-  'client: renders all three switches',
-  ['allowRead', 'allowWrite', 'allowShell'].every((field) => clientSource.includes(`toggle('${field}')`))
+  'client: renders all four switches',
+  ['allowRead', 'allowWrite', 'allowShell', 'allowAgent'].every((field) => clientSource.includes(`toggle('${field}')`))
 )
 // Scoping: every request must name the session, or the Host would edit a
 // process-wide policy instead of this conversation's.

@@ -21,10 +21,16 @@
  * SCOPE: ONE SESSION, PLUS WHAT IT SPAWNED
  *   A policy is held by ONE session. The menu edits that session, and every agent
  *   descended from it resolves to the same policy, so the two behave as one unit:
- *   restricting a session restricts the subagents it delegates to. This matters
- *   because `subagent` and `workflow` are NOT themselves governed — they touch
- *   nothing, they only create children. If a child did not inherit, delegating
- *   would be a one-step way around the switch.
+ *   restricting a session restricts the subagents it delegates to. If a child did
+ *   not inherit, delegating would be a one-step way around the read/write/shell
+ *   switches.
+ *
+ *   Inheritance and the `agent` switch cover different things, and both are needed.
+ *   Inheritance decides what a child may DO once it exists; the `agent` switch
+ *   decides whether this session may CREATE or DRIVE one at all. A session with
+ *   `agent` off cannot delegate even though a child would have inherited its
+ *   restrictions — which is the point: delegation itself is off, not merely made
+ *   harmless.
  *
  *   Inheritance is resolved LAZILY, by walking the parent chain at call time
  *   rather than copying a policy into each child when it is created. Lazily is
@@ -84,25 +90,49 @@ const HEADER = 'x-dsh-tool-guard'
  * restart. Bump this whenever a field is renamed, a switch is added, or the route's
  * shape changes.
  */
-const PROTOCOL = 4
+const PROTOCOL = 5
 
 /**
  * Tools that change files, and so are refused while writes are disabled.
  *
- * `subagent`/`workflow` are NOT here — they touch nothing themselves, and the child
- * agent's own tool calls resolve to the same policy through the parent chain, so a
- * subagent is stopped at the point where it actually writes. `todo_write` /
- * `create_goal` are NOT here either: they only move the agent's own bookkeeping and
- * touching them would interrupt work without protecting anything.
+ * `subagent`/`workflow`/`send_message` are NOT here: they change no file. They are
+ * governed by the `agent` switch instead, which is a different question. `todo_write`
+ * / `create_goal` are NOT governed at all: they only move the agent's own
+ * bookkeeping and touching them would interrupt work without protecting anything.
  */
 const WRITE_TOOLS = new Set([
   'write',
   'edit',
   'plugin_manager',
   'present',
-  'send_message',
   'import_chat'
 ])
+
+/**
+ * Tools that delegate to or drive ANOTHER agent, and so are refused while the
+ * agent switch is off.
+ *
+ * This covers the delegation tools themselves — `subagent`, `subagent_fork`, and
+ * `workflow`, whose `agent()` hook spawns children in a loop. Blocking here is
+ * different in kind from the other three switches: those gate what THIS session
+ * does, while this one gates whether the session may act through anyone else.
+ *
+ * `send_message` is here rather than under writes, where it used to live. It
+ * performs no file or system change; what it does is hand work to another agent,
+ * which is exactly this kind. Keeping it under writes would mean a user who turned
+ * off "delegation" could still drive existing children — the switch would leak.
+ *
+ * `interrupt_agent` is deliberately NOT governed, anywhere. It stops work, so
+ * blocking it removes the user's own ability to wind a runaway delegation down,
+ * protects nothing, and is precisely the wrong thing to disable during the
+ * incident this plugin exists for.
+ *
+ * Children themselves are governed by the ordinary switches through inheritance:
+ * a restricted session's subagents resolve to the same policy, so they cannot
+ * write or run commands just because they were handed the task. This switch is
+ * about CREATING and DRIVING them, which inheritance alone cannot express.
+ */
+const AGENT_TOOLS = new Set(['subagent', 'subagent_fork', 'workflow', 'send_message'])
 
 /**
  * Tools that run an arbitrary command, and so are refused while the shell is off.
@@ -146,13 +176,13 @@ const READ_TOOLS = new Set([
 ])
 
 /** Every governed kind, in the order the control lists them. */
-const KINDS = ['read', 'write', 'shell']
+const KINDS = ['read', 'write', 'shell', 'agent']
 
 /** The policy field that owns each kind. */
-const SWITCH_FOR = { read: 'allowRead', write: 'allowWrite', shell: 'allowShell' }
+const SWITCH_FOR = { read: 'allowRead', write: 'allowWrite', shell: 'allowShell', agent: 'allowAgent' }
 
 /** The policy every session has until the user restricts it. */
-const ALLOWED = Object.freeze({ allowRead: true, allowWrite: true, allowShell: true })
+const ALLOWED = Object.freeze({ allowRead: true, allowWrite: true, allowShell: true, allowAgent: true })
 
 /**
  * The live switch, per session.
@@ -197,6 +227,7 @@ function classify(name, extensions) {
   if (READ_TOOLS.has(name)) return 'read'
   if (WRITE_TOOLS.has(name)) return 'write'
   if (SHELL_TOOLS.has(name)) return 'shell'
+  if (AGENT_TOOLS.has(name)) return 'agent'
   return undefined
 }
 
@@ -220,12 +251,13 @@ function readExtensions(env) {
   return {
     read: split(env?.DSH_TOOL_GUARD_READ),
     write: split(env?.DSH_TOOL_GUARD_WRITE),
-    shell: split(env?.DSH_TOOL_GUARD_SHELL)
+    shell: split(env?.DSH_TOOL_GUARD_SHELL),
+    agent: split(env?.DSH_TOOL_GUARD_AGENT)
   }
 }
 
 /** The Chinese label each kind carries in a denial. */
-const ZH_KIND = { read: '读操作', write: '写操作', shell: '命令行' }
+const ZH_KIND = { read: '读操作', write: '写操作', shell: '命令行', agent: '子智能体调用' }
 
 /**
  * The reason the model receives, in both languages the deployment may run in.
@@ -369,7 +401,8 @@ function snapshot(sessionId) {
     allowRead: policy.allowRead,
     allowWrite: policy.allowWrite,
     allowShell: policy.allowShell,
-    blocked: { ...(record?.blocked ?? { read: 0, write: 0, shell: 0 }) },
+    allowAgent: policy.allowAgent,
+    blocked: { ...(record?.blocked ?? { read: 0, write: 0, shell: 0, agent: 0 }) },
     last: record?.last
   }
 }
@@ -445,10 +478,11 @@ async function handleState(req, res) {
   const next = {
     allowRead: current?.allowRead ?? ALLOWED.allowRead,
     allowWrite: current?.allowWrite ?? ALLOWED.allowWrite,
-    allowShell: current?.allowShell ?? ALLOWED.allowShell
+    allowShell: current?.allowShell ?? ALLOWED.allowShell,
+    allowAgent: current?.allowAgent ?? ALLOWED.allowAgent
   }
   for (const kind of recognized) next[SWITCH_FOR[kind]] = payload[SWITCH_FOR[kind]]
-  if (next.allowRead && next.allowWrite && next.allowShell) {
+  if (next.allowRead && next.allowWrite && next.allowShell && next.allowAgent) {
     // Nothing is restricted, so there is no policy to hold. Dropping the entry is
     // what lets a later-created descendant inherit "allowed" by simple absence,
     // instead of every session accumulating an entry it does not need.
@@ -456,7 +490,7 @@ async function handleState(req, res) {
   } else {
     policies.set(ownerId, {
       ...next,
-      blocked: current?.blocked ?? { read: 0, write: 0, shell: 0 },
+      blocked: current?.blocked ?? { read: 0, write: 0, shell: 0, agent: 0 },
       last: current?.last
     })
   }
@@ -552,6 +586,7 @@ export function apply(ctx) {
 }
 
 export {
+  AGENT_TOOLS,
   ALLOWED,
   HEADER,
   KINDS,

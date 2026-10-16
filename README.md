@@ -1,7 +1,8 @@
 # dsh-tool-guard
 
-在**当前会话**里实时禁用「读操作」「写操作」或「命令行」，并连带它派生出的全部子会话。
-三个开关在输入框工具条上，关掉哪个就禁哪个，**下一次工具调用**即被拦截，模型收到的是：
+在**当前会话**里实时禁用「读操作」「写操作」「命令行」或「子智能体调用」，并连带它派生出的
+全部子会话。四个开关在输入框工具条上，关掉哪个就禁哪个，**下一次工具调用**即被拦截，
+模型收到的是：
 
 ```
 此操作已被用户实时禁用：写操作「write」未执行，且不要再尝试调用。This operation is
@@ -11,13 +12,13 @@ continue with what the user allows, or tell the user what you need.
 
 ## 开关语义
 
-**打开 = 允许**。三个开关默认全部打开，也就是一切照常；**关掉**某一个，那一类工具才被
+**打开 = 允许**。四个开关默认全部打开，也就是一切照常；**关掉**某一个，那一类工具才被
 禁用。这样默认状态不会看起来像受限，且"开关是开着的"读起来就是"这类工具能用"。
 
 ## 为什么是"实时"
 
 拦截由 `ctx.tools.guard()` 完成。它是工具管线里**同步**、**单调**的一环，位于
-`tools/pre-execute` 瀑布之后、真正派发之前，每次调用都重新读一遍内存里的三个布尔值。
+`tools/pre-execute` 瀑布之后、真正派发之前，每次调用都重新读一遍内存里的四个布尔值。
 所以翻转开关改变的正是下一次调用——不需要重载插件、不需要重启、不需要刷新页面。
 
 `tools` 的服务契约本身就把这两条通道分了工：
@@ -33,9 +34,10 @@ continue with what the user allows, or tell the user what you need.
 | 开关 | 关掉后拦住的工具 |
 | --- | --- |
 | **读操作** | `read` `glob` `grep` `read_image` `web_search` `web_fetch` `list_agents` `job_output` `job_list` `get_goal` `skill` `cordis_inspect_*` `load_workspace_dependencies` |
-| **写操作** | `write` `edit` `plugin_manager` `present` `send_message` `import_chat` |
+| **写操作** | `write` `edit` `plugin_manager` `present` `import_chat` |
 | **命令行** | `bash` `pwsh` |
-| **不归管** | 其余一切，包括 `todo_write`、`create_goal`、`subagent`、`workflow`、以及 MCP 与第三方插件的工具 |
+| **子智能体** | `subagent` `subagent_fork` `workflow` `send_message` |
+| **不归管** | 其余一切，包括 `todo_write`、`create_goal`、`interrupt_agent`、`list_agents`、以及 MCP 与第三方插件的工具 |
 
 ### 命令行为什么单独一个开关
 
@@ -48,12 +50,27 @@ continue with what the user allows, or tell the user what you need.
 不让结构化文件工具动；或要 `ls`/`git status` 看情况、但不让 `write`/`edit` 落笔）。
 菜单里就写在命令行那一行上，不留给用户去推断。**关命令行是强设置，关写是精确设置。**
 
+### 子智能体为什么单独一个开关
+
+因为它拦的是**另一种问题**。前三个开关管"这个会话自己做什么"；这一个管"这个会话能不能
+**通过别人**做事"——调用 `subagent` / `subagent_fork` / `workflow` 去支使另一个 agent。
+
+继承**不能**替代它。继承决定的是"子 agent 一旦存在，允许它做什么"；而这个开关决定的是
+"能不能创建或驱动它"。两者都要：关掉子智能体开关之后，委派这件事本身就是关的，而不是
+"委派出去了但干不了活"。
+
+`send_message` 也归这一类，**从写操作移了过来**。它不改任何文件，做的是把活交给另一个
+agent——如果留在写操作里，一个关掉了"委派"的用户仍然能支使已经存在的子会话，开关就漏了。
+
+**`interrupt_agent` 一律不归管**：它是停止工作的，拦住它等于拿掉用户自己给失控委派收尾的
+手段，什么都保护不了，而且恰恰是这个插件存在的场景里最不该禁的东西。
+
+`list_agents` 仍是读操作（纯观察）。
+
 ### 其余取舍
 
 - **判定按工具名**，不解析 `bash` 的命令行去猜里面是 `rm` 还是 `ls`——猜错两个方向都糟：
   `cat` 可以藏重定向，而"放 shell 过去"会让开关失去意义。
-- **`subagent` / `workflow` 不归管。** 它们自己不动任何东西；子 agent 的工具调用会沿父链
-  解析到同一个策略，所以会在真正落笔的那一步被拦住（见下面「作用范围」）。
 - **`todo_write` / `create_goal` 不归管。** 它们只动 agent 自己的记账，拦住只会打断工作。
 
 **未知工具不归管**是刻意的：猜"写"会误伤无害工具，猜"读"会放过真正的写操作。要覆盖
@@ -64,6 +81,7 @@ MCP / 第三方工具，用宿主环境变量追加（逗号分隔），它**优
 DSH_TOOL_GUARD_READ=mcp__fs__read
 DSH_TOOL_GUARD_WRITE=mcp__fs__write,mcp__fs__remove
 DSH_TOOL_GUARD_SHELL=mcp__exec__run
+DSH_TOOL_GUARD_AGENT=mcp__orchestrate__spawn
 ```
 
 ## 作用范围：单个会话 + 它派生的子会话
@@ -100,8 +118,8 @@ DSH_TOOL_GUARD_SHELL=mcp__exec__run
 
 输入框工具条右侧（`conversation.input.right` 列表槽，模型选择器旁边）一枚盾牌图标，
 **不带文字**——工具条那一行还要放模型选择器和权限标签，一个标签只是重复 tooltip 已有的
-信息。点开是三行开关：读操作 / 写操作 / 命令行，各自带一行说明，命令行那行写明它能读写
-文件。菜单打开时每 2 秒轮询一次宿主，所以别的窗口（第二个标签页）改了开关也能跟上；轮询
+信息。点开是四行开关：读操作 / 写操作 / 命令行 / 子智能体，各自带一行说明，命令行那行写明
+它能读写文件。菜单打开时每 2 秒轮询一次宿主，所以别的窗口（第二个标签页）改了开关也能跟上；轮询
 只在菜单打开时进行。会话自身是从槽位的 `sessionId` 座位上取的，每个请求都带着它。
 
 **触发按钮的颜色随"是否有限制"走，不随"是否允许"走**：默认三个全开时它保持中性色，只有
@@ -152,8 +170,8 @@ body 字段。缺了它一律 `400`，因为"没有会话"的写入没有安全�
 单会话作用域，猜一个会话更是错。
 
 - `GET` `/dsh-tool-guard/state?sessionId=<id>`
-  → `{ ok: true, state: { protocol, sessionId, ownerId, inherited, allowRead, allowWrite, allowShell, blocked: { read, write, shell }, last } }`
-- `POST` → body 为 `{ sessionId, allowRead?, allowWrite?, allowShell? }`，只接受这三个布尔值。
+  → `{ ok: true, state: { protocol, sessionId, ownerId, inherited, allowRead, allowWrite, allowShell, allowAgent, blocked: { read, write, shell, agent }, last } }`
+- `POST` → body 为 `{ sessionId, allowRead?, allowWrite?, allowShell?, allowAgent? }`，只接受这四个布尔值。
   必须带 `x-dsh-tool-guard` 请求头——跨源页面可以不带预检地发"简单请求"，要求自定义头
   才是真正逼出预检、从而让浏览器拦下它的东西。
 - `409` → body 里一个已识别字段都没有，即协议对不上（多半是宿主端落后）。错误信息里带

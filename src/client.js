@@ -1,14 +1,14 @@
 // Tool guard — CLIENT half.
 //
 // A control on the composer's input toolbar ("conversation.input.right", the list
-// slot immediately left of the model selector) with three switches: READ, WRITE,
-// and SHELL. Flipping one takes effect on the very next tool call, because the host
+// slot immediately left of the model selector) with four switches: READ, WRITE,
+// SHELL, and SUBAGENTS. Flipping one takes effect on the very next tool call, because the host
 // half enforces it with a synchronous `ctx.tools.guard()` that reads the same
 // booleans this control writes. Nothing here re-renders the conversation, reloads a
 // plugin, or touches the session log.
 //
 // What a switch means:
-//   ON = ALLOWED. All three start on, so a fresh load permits everything and
+//   ON = ALLOWED. All four start on, so a fresh load permits everything and
 //   turning one off is what disables its tools. The reverse convention (on =
 //   blocked) made the default state look like a restriction.
 //
@@ -30,9 +30,14 @@
 //   SHELL covers command execution (bash / pwsh) and is its OWN switch, because a
 //   shell is a superset of the write tools: allowing the shell while denying writes
 //   does not prevent writes, it only stops the tools named for it. That asymmetry is
-//   stated on the shell row rather than left to be inferred. Tools that belong to no
-//   kind — an MCP server, a third-party plugin — are NOT governed. Extend with the
-//   DSH_TOOL_GUARD_READ / _WRITE / _SHELL env vars on the Host.
+//   stated on the shell row rather than left to be inferred.
+//   SUBAGENTS covers delegating — subagent / subagent_fork / workflow / send_message.
+//   It gates whether this session may act THROUGH another agent, which the other
+//   three cannot express: they gate what this session does itself, and inheritance
+//   only decides what a child may do once it already exists.
+//   Tools that belong to no kind — an MCP server, a third-party plugin — are NOT
+//   governed. Extend with the DSH_TOOL_GUARD_READ / _WRITE / _SHELL / _AGENT env
+//   vars on the Host.
 //
 // Why the denial wording matters here:
 //   A refused call comes back to the model as an error whose message is the whole
@@ -77,7 +82,7 @@ window.__ModuleLoader__.load({
      * `denyRead`, ignores the unknown field and answers with unchanged state.
      * Comparing versions turns that silent bounce into a stated cause.
      */
-    const PROTOCOL = 4
+    const PROTOCOL = 5
     /** Menu geometry: fixed width so the open position can be computed before layout. */
     const MENU_WIDTH = 288
     const MENU_GAP = 6
@@ -109,6 +114,10 @@ window.__ModuleLoader__.load({
       // costing a paragraph at the bottom of the menu.
       shell: '命令行',
       shellHint: '执行命令，也能读写文件',
+      // The delegation switch. Named for what it stops rather than for the tool, so a
+      // user who has never read the tool list can still tell what it does.
+      agent: '子智能体',
+      agentHint: '调用 subagent / workflow，或给已有子会话派活',
       loading: '正在读取状态…',
       failed: '读取失败：',
       retry: '重试',
@@ -131,6 +140,8 @@ window.__ModuleLoader__.load({
       writeHint: 'write files, edit files',
       shell: 'Shell',
       shellHint: 'run commands — can also write files',
+      agent: 'Subagents',
+      agentHint: 'call subagent / workflow, or send work to an existing child',
       loading: 'Reading state…',
       failed: 'Could not read state: ',
       retry: 'Retry',
@@ -446,6 +457,28 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /**
+     * Two linked nodes: the delegation side.
+     *
+     * Drawn as a parent node with one child rather than a generic "share" glyph,
+     * because the switch is specifically about creating a subordinate agent — the
+     * shape says which relationship is being turned off.
+     */
+    function AgentsIcon() {
+      return h(
+        'svg',
+        { width: 14, height: 14, viewBox: '0 0 16 16', fill: 'none', 'aria-hidden': 'true' },
+        h('circle', { cx: 5.6, cy: 5, r: 2.2, stroke: 'currentColor', 'stroke-width': 1.2 }),
+        h('circle', { cx: 11.2, cy: 11.4, r: 1.9, stroke: 'currentColor', 'stroke-width': 1.2 }),
+        h('path', {
+          d: 'M6.6 6.9 10 9.9',
+          stroke: 'currentColor',
+          'stroke-width': 1.2,
+          'stroke-linecap': 'round'
+        })
+      )
+    }
+
     // --- components -------------------------------------------------------------
     /**
      * One governed side: icon, label, what it covers, and the switch.
@@ -511,7 +544,7 @@ window.__ModuleLoader__.load({
         const activeSession = typeof sessionId === 'string' && sessionId.length > 0 ? sessionId : undefined
         const [open, setOpen] = useState(false)
         // undefined until the first read answers, so the menu can show the loading
-        // line rather than rendering three switches as off.
+        // line rather than rendering four switches as off.
         const [data, setData] = useState(undefined)
         const [status, setStatus] = useState(undefined)
         const [error, setError] = useState(undefined)
@@ -681,6 +714,7 @@ window.__ModuleLoader__.load({
         const readOn = data?.allowRead !== false
         const writeOn = data?.allowWrite !== false
         const shellOn = data?.allowShell !== false
+        const agentOn = data?.allowAgent !== false
 
         const menu =
           !open || anchor === undefined || typeof document === 'undefined'
@@ -751,6 +785,15 @@ window.__ModuleLoader__.load({
                           busy: pending === 'allowShell',
                           onToggle: () => toggle('allowShell')
                         }),
+                        h(GuardRow, {
+                          key: 'agent',
+                          icon: h(AgentsIcon, null),
+                          title: t('agent'),
+                          hint: t('agentHint'),
+                          checked: agentOn,
+                          busy: pending === 'allowAgent',
+                          onToggle: () => toggle('allowAgent')
+                        }),
                         // Only a failure or the first read gets a line here. The
                         // switches say what the state is, so a summary line repeating
                         // them would just push them down the menu.
@@ -791,10 +834,10 @@ window.__ModuleLoader__.load({
         // shield carries the state and the tooltip carries the name, so a text label
         // beside them repeated information and widened the composer row for nothing.
         // The highlight tracks RESTRICTION, not permission: with ON = allowed, a
-        // freshly loaded control has all three switches on and must look neutral.
+        // freshly loaded control has all four switches on and must look neutral.
         // Lighting up on "everything allowed" would make the normal state the loud
         // one and hide the state worth noticing — that something is switched off.
-        const restricted = !readOn || !writeOn || !shellOn
+        const restricted = !readOn || !writeOn || !shellOn || !agentOn
         return h(
           'div',
           { className: 'dsh-tool-guard-root', ref: rootRef },
