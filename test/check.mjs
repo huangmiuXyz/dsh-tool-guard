@@ -6,8 +6,11 @@
 //     string | undefined`, and "synchronous check; a returned string denies the
 //     execution" (the `tools` Service contract). The returned value is the exact
 //     disposer that unregisters the guard.
-//   - `ctx.effect(fn, label)`: Cordis effect registration; `fn` returns a disposer.
-//   - `ctx.inject(names, cb)`: deferred registration once the named services exist.
+//   - `ctx.on(name, listener)`: the payload for `agent/created` is
+//     `{ agent, source, signal }` (the Event contract).
+//   - `ctx.agents.isOwnedBy(id, owner)`: "Test whether a live agent was created
+//     through one exact parent agent's scoped context."
+//   - `ctx.effect(fn, label)` / `ctx.inject(names, cb)`: Cordis registration.
 //   - `webServer.register({ kind: 'exact', path, handler })`: the shipped route
 //     shape, read off `dsh-edit-retry`'s host half.
 //   - The control route is exercised over a REAL node:http server rather than a
@@ -66,21 +69,31 @@ check(
 check('client half: registers an id', clientSource.includes("id: 'dsh-tool-guard'"), 'window.__ModuleLoader__.load')
 
 // --- 2. classification --------------------------------------------------------
-const { HEADER, PROTOCOL, READ_TOOLS, ROUTE, SHELL_TOOLS, WRITE_TOOLS, classify, denyReason, makeGuard, readExtensions } =
-  await import(path.join(PKG, 'src', 'index.js'))
+const {
+  ALLOWED,
+  HEADER,
+  PROTOCOL,
+  READ_TOOLS,
+  ROUTE,
+  SHELL_TOOLS,
+  WRITE_TOOLS,
+  classify,
+  denyReason,
+  makeGuard,
+  ownerOf,
+  parents,
+  policies,
+  policyFor,
+  readExtensions,
+  snapshot
+} = await import(path.join(PKG, 'src', 'index.js'))
 
 // The two halves are loaded independently (the bundle hot-reloads; the host half
 // does not), so their protocol numbers are the ONLY thing keeping a saved edit from
 // silently pairing a new client with a stale host. They must be edited together.
 const clientProtocol = Number(clientSource.match(/^\s*const PROTOCOL = (\d+)/m)?.[1])
 check('protocol: the client half declares it', Number.isInteger(clientProtocol), String(clientProtocol))
-check(
-  'protocol: both halves agree',
-  clientProtocol === PROTOCOL,
-  `client ${clientProtocol} vs host ${PROTOCOL}`
-)
-// A field rename is exactly what a protocol bump accompanies, so assert the
-// renamed fields are the ones the client actually posts.
+check('protocol: both halves agree', clientProtocol === PROTOCOL, `client ${clientProtocol} vs host ${PROTOCOL}`)
 check(
   'protocol: the client posts the fields the host reads',
   ['allowRead', 'allowWrite', 'allowShell'].every((field) => clientSource.includes(`toggle('${field}')`))
@@ -99,7 +112,6 @@ check('classify: web_fetch is a read', classify('web_fetch', none) === 'read')
 // Session bookkeeping is deliberately ungoverned: blocking it would interrupt work
 // without protecting anything on disk.
 check('classify: todo_write is ungoverned', classify('todo_write', none) === undefined)
-check('classify: subagent is ungoverned', classify('subagent', none) === undefined)
 check('classify: unknown tool is ungoverned', classify('mcp__foo__bar', none) === undefined)
 // An extension outranks the built-in table, so a name can be MOVED between kinds
 // rather than being unreachable behind the built-in entry.
@@ -107,10 +119,7 @@ const moved = { read: new Set(['bash']), write: new Set(), shell: new Set() }
 check('classify: extension moves bash to reads', classify('bash', moved) === 'read')
 const added = { read: new Set(), write: new Set(['mcp__fs__write']), shell: new Set() }
 check('classify: extension adds an unknown tool', classify('mcp__fs__write', added) === 'write')
-check(
-  'classify: all three built-in lists non-empty',
-  WRITE_TOOLS.size > 0 && READ_TOOLS.size > 0 && SHELL_TOOLS.size > 0
-)
+check('classify: all three built-in lists non-empty', WRITE_TOOLS.size > 0 && READ_TOOLS.size > 0 && SHELL_TOOLS.size > 0)
 // A name in two built-in lists would be governed by whichever set is consulted
 // first, which is an invisible change of meaning — so the lists must stay disjoint.
 const allLists = { read: READ_TOOLS, write: WRITE_TOOLS, shell: SHELL_TOOLS }
@@ -126,61 +135,133 @@ for (const left of names) {
 }
 check('classify: the built-in lists are disjoint', overlaps.length === 0, overlaps.join(', '))
 
-// --- 3. the guard -------------------------------------------------------------
-// Every switch starts ALLOWED, which is what "on" means after the flip.
-const fresh = () => ({
+// --- 3. the guard, per session + inheritance ----------------------------------
+/** A policy record as the host stores it. */
+const record = (patch = {}) => ({
   allowRead: true,
   allowWrite: true,
   allowShell: true,
   blocked: { read: 0, write: 0, shell: 0 },
-  last: undefined
+  last: undefined,
+  ...patch
 })
-const call = (name) => ({ name, callId: 'call-1', arguments: {}, signal: new AbortController().signal })
+const freshPolicies = (entries = {}) =>
+  new Map(Object.entries(entries).map(([id, patch]) => [id, record(patch)]))
+const freshTree = (entries = {}) => new Map(Object.entries(entries))
+const call = (name, sessionId) => ({
+  name,
+  callId: 'call-1',
+  arguments: {},
+  signal: new AbortController().signal,
+  ...(sessionId === undefined ? {} : { agent: { id: sessionId } })
+})
 
 {
-  const live = fresh()
-  const guard = makeGuard(live, none)
-  check('guard: allows a write while the switch is on', guard(call('write')) === undefined)
-  live.allowWrite = false
-  const reason = guard(call('write'))
+  const table = freshPolicies()
+  const guard = makeGuard(table, freshTree(), none)
+  check('guard: allows a write while the switch is on', guard(call('write', 's1')) === undefined)
+  table.set('s1', record({ allowWrite: false }))
+  const reason = guard(call('write', 's1'))
   check('guard: denies a write once the switch is off', typeof reason === 'string', String(reason))
   check('guard: denial names the tool', reason.includes('"write"'), reason)
   check('guard: denial uses the requested wording', reason.includes('此操作已被用户实时禁用'), reason)
   check('guard: denial tells the model not to retry', reason.includes('Do not retry'), reason)
-  check('guard: counts the denial', live.blocked.write === 1, String(live.blocked.write))
-  check('guard: records the last denial', live.last?.tool === 'write' && live.last?.kind === 'write')
-  // The whole point of three switches: turning writes off must NOT touch the shell,
-  // and turning the shell off must not touch writes. This is the pair that regressed
-  // when bash lived in the write list.
-  check('guard: disabling writes leaves the shell alone', guard(call('bash')) === undefined)
-  live.allowShell = false
-  check('guard: the shell is denied by its own switch', typeof guard(call('bash')) === 'string')
-  check('guard: the shell denial says 命令行', guard(call('bash')).includes('命令行'), guard(call('bash')))
-  // Turning it back on must restore the very next call — that is the whole promise.
-  live.allowWrite = true
-  check('guard: allows again as soon as the switch is back on', guard(call('write')) === undefined)
+  check('guard: counts the denial on the owning session', table.get('s1').blocked.write === 1, String(table.get('s1').blocked.write))
+  check(
+    'guard: records the last denial with its session',
+    table.get('s1').last?.tool === 'write' && table.get('s1').last?.sessionId === 's1'
+  )
+  // The whole point of three switches: denying writes must NOT touch the shell, and
+  // denying the shell must not touch writes.
+  check('guard: denying writes leaves the shell alone', guard(call('bash', 's1')) === undefined)
+  table.set('s1', record({ allowWrite: false, allowShell: false }))
+  check('guard: the shell is denied by its own switch', typeof guard(call('bash', 's1')) === 'string')
+  check('guard: the shell denial says 命令行', guard(call('bash', 's1')).includes('命令行'))
+  table.set('s1', record({ allowShell: false }))
+  check('guard: allows again as soon as the switch is back on', guard(call('write', 's1')) === undefined)
 }
 
 {
-  const live = fresh()
-  const guard = makeGuard(live, none)
-  live.allowRead = false
-  check('guard: denies a read when only reads are off', typeof guard(call('read')) === 'string')
-  check('guard: still allows a write when only reads are off', guard(call('write')) === undefined)
-  check('guard: still allows the shell when only reads are off', guard(call('bash')) === undefined)
-  check('guard: read count is separate', live.blocked.read === 1 && live.blocked.write === 0)
-  check('guard: read reason differs from the write reason', denyReason('read', 'read') !== denyReason('write', 'write'))
-  check('guard: shell reason differs from the write reason', denyReason('bash', 'shell') !== denyReason('write', 'write'))
+  // THE core scoping promise: restricting one session must not touch another.
+  const table = freshPolicies()
+  const guard = makeGuard(table, freshTree(), none)
+  table.set('s1', record({ allowWrite: false }))
+  check('scope: the restricted session is denied', typeof guard(call('write', 's1')) === 'string')
+  check('scope: an unrelated session is untouched', guard(call('write', 's2')) === undefined)
+  check('scope: and stays untouched for reads', guard(call('read', 's2')) === undefined)
+  table.set('s2', record({ allowRead: false }))
+  check(
+    'scope: each session keeps its own read switch',
+    guard(call('read', 's1')) === undefined && typeof guard(call('read', 's2')) === 'string'
+  )
+  table.set('s1', record())
+  check('scope: releasing one session does not release the other', typeof guard(call('read', 's2')) === 'string')
 }
 
 {
-  const live = fresh()
-  live.allowRead = false
-  live.allowWrite = false
-  live.allowShell = false
-  const guard = makeGuard(live, none)
-  check('guard: ungoverned tool is never blocked', guard(call('todo_write')) === undefined)
-  check('guard: ungoverned call records nothing', live.last === undefined && live.blocked.write === 0)
+  // Inheritance: a restriction reaches what the session spawned, however deep, and
+  // whether or not the child existed when the switch was flipped.
+  const table = freshPolicies()
+  const tree = freshTree({ child: 'root', grand: 'child' })
+  const guard = makeGuard(table, tree, none)
+  check('inherit: an unrestricted tree allows everything', guard(call('write', 'grand')) === undefined)
+  // Restrict the ROOT, after the descendants already exist — the lazy walk is what
+  // makes this work without re-visiting them.
+  table.set('root', record({ allowWrite: false }))
+  check('inherit: the root is denied', typeof guard(call('write', 'root')) === 'string')
+  check('inherit: the child inherits', typeof guard(call('write', 'child')) === 'string')
+  check('inherit: the grandchild inherits', typeof guard(call('write', 'grand')) === 'string')
+  check('inherit: the inherited denial still allows reads', guard(call('read', 'grand')) === undefined)
+  // Releasing the root releases the whole subtree at once.
+  table.delete('root')
+  check('inherit: releasing the root releases the child', guard(call('write', 'child')) === undefined)
+  check('inherit: releasing the root releases the grandchild', guard(call('write', 'grand')) === undefined)
+  check('inherit: an unrelated session is untouched', guard(call('write', 'other')) === undefined)
+}
+
+{
+  // A child may hold its own restriction; the NEAREST one wins, so restricting a
+  // child inside a restricted parent does not silently reuse the parent's policy.
+  const table = freshPolicies()
+  const tree = freshTree({ child: 'root' })
+  const guard = makeGuard(table, tree, none)
+  table.set('root', record({ allowRead: false }))
+  check('inherit: the child sees the parent restriction', typeof guard(call('read', 'child')) === 'string')
+  table.set('child', record({ allowShell: false }))
+  check("inherit: the child's own policy wins over the parent's", guard(call('read', 'child')) === undefined)
+  check("inherit: and the child's own restriction applies", typeof guard(call('bash', 'child')) === 'string')
+  check('inherit: the parent keeps its own policy', typeof guard(call('read', 'root')) === 'string')
+  check("inherit: the parent is not given the child's shell rule", guard(call('bash', 'root')) === undefined)
+}
+
+{
+  // A call with no agent has no session to carry a policy, so it is out of scope
+  // rather than implicitly denied.
+  const table = freshPolicies({ root: { allowRead: false, allowWrite: false, allowShell: false } })
+  const guard = makeGuard(table, freshTree(), none)
+  check('scope: an agentless call is not governed', guard(call('write', undefined)) === undefined)
+  check('scope: an agentless call records nothing', table.get('root').blocked.write === 0)
+  check('scope: an ungoverned tool is never blocked', guard(call('todo_write', 'root')) === undefined)
+  check('scope: an ungoverned call records nothing', table.get('root').last === undefined)
+}
+
+{
+  // A cycle would hang the tool pipeline inside a synchronous guard, where a hang
+  // cannot be timed out. The walk must terminate and answer.
+  const table = freshPolicies()
+  const tree = freshTree({ a: 'b', b: 'a' })
+  const guard = makeGuard(table, tree, none)
+  check('safety: a parent cycle terminates', guard(call('write', 'a')) === undefined)
+  table.set('a', record({ allowWrite: false }))
+  check('safety: a parent cycle still resolves the restriction', typeof guard(call('write', 'a')) === 'string')
+}
+
+{
+  // Unreadable policy objects must fail CLOSED: only an exact `true` permits.
+  const table = new Map([['root', { blocked: { read: 0, write: 0, shell: 0 } }]])
+  const guard = makeGuard(table, freshTree(), none)
+  check('safety: an absent allowWrite fails closed', typeof guard(call('write', 'root')) === 'string')
+  check('safety: an absent allowRead fails closed', typeof guard(call('read', 'root')) === 'string')
 }
 
 // --- 4. extensions ------------------------------------------------------------
@@ -190,33 +271,36 @@ const call = (name) => ({ name, callId: 'call-1', arguments: {}, signal: new Abo
     DSH_TOOL_GUARD_READ: 'mcp__fs__read',
     DSH_TOOL_GUARD_SHELL: 'mcp__exec__run'
   })
-  check('env: write names parsed and trimmed', extensions.write.has('mcp__fs__write') && extensions.write.has('mcp__fs__remove'))
+  check(
+    'env: write names parsed and trimmed',
+    extensions.write.has('mcp__fs__write') && extensions.write.has('mcp__fs__remove')
+  )
   check('env: read names parsed', extensions.read.has('mcp__fs__read'))
   check('env: shell names parsed', extensions.shell.has('mcp__exec__run'))
   const empty = readExtensions(undefined)
+  check('env: absent vars yield empty sets', empty.write.size === 0 && empty.read.size === 0 && empty.shell.size === 0)
+  const table = freshPolicies({ root: { allowWrite: false } })
+  check('env: an extended write tool is denied', typeof makeGuard(table, freshTree(), extensions)(call('mcp__fs__write', 'root')) === 'string')
+  const shellTable = freshPolicies({ root: { allowShell: false } })
   check(
-    'env: absent vars yield empty sets',
-    empty.write.size === 0 && empty.read.size === 0 && empty.shell.size === 0
+    'env: an extended shell tool is denied',
+    typeof makeGuard(shellTable, freshTree(), extensions)(call('mcp__exec__run', 'root')) === 'string'
   )
-  const live = fresh()
-  live.allowWrite = false
-  const guard = makeGuard(live, extensions)
-  check('env: an extended write tool is denied', typeof guard(call('mcp__fs__write')) === 'string')
-  const shellLive = fresh()
-  shellLive.allowShell = false
-  const shellGuard = makeGuard(shellLive, extensions)
-  check('env: an extended shell tool is denied', typeof guard === 'function' && typeof shellGuard(call('mcp__exec__run')) === 'string')
 }
 
 // --- 5. the live pipeline, over a real HTTP server ----------------------------
 /**
- * A Cordis-shaped context that registers the bundle the way the Loader would, and
- * a REAL http server standing in for `webServer` — so the route, the header check
- * and the body read are exercised end to end instead of being asserted about.
+ * A Cordis-shaped context that registers the bundle the way the Loader would, with
+ * a REAL http server standing in for `webServer` and a fake agent registry that can
+ * answer `isOwnedBy` — so the route, the header check, the body read, and the
+ * parent detection are all exercised end to end.
  */
 function fakeHost() {
   const guards = []
   const routes = new Map()
+  const listeners = new Map()
+  const live = []
+  const owners = new Map()
   const server = http.createServer((req, res) => {
     const route = routes.get(new URL(req.url, 'http://localhost').pathname)
     if (route === undefined) {
@@ -231,6 +315,22 @@ function fakeHost() {
       return () => routes.delete(route.path)
     }
   }
+  const agents = {
+    list: () => [...live],
+    isOwnedBy: (id, owner) => owners.get(id) === owner.id,
+    /** Test-only: create an agent, optionally owned by an existing one. */
+    spawn(id, parentId) {
+      live.push({ id })
+      if (parentId !== undefined) owners.set(id, parentId)
+      const payload = { agent: { id }, source: 'startup' }
+      for (const listener of listeners.get('agent/created') ?? []) listener(payload)
+    },
+    dispose(id) {
+      const index = live.findIndex((agent) => agent.id === id)
+      if (index >= 0) live.splice(index, 1)
+      for (const listener of listeners.get('agent/disposed') ?? []) listener({ agent: { id } })
+    }
+  }
   const ctx = {
     tools: {
       guard(fn) {
@@ -241,18 +341,26 @@ function fakeHost() {
         }
       }
     },
-    get: (name) => (name === 'webServer' ? webServer : undefined),
-    inject: (names, callback) => {
-      const scope = { webServer, effect: (fn) => fn() }
-      callback(scope)
+    on(name, listener) {
+      const list = listeners.get(name) ?? []
+      list.push(listener)
+      listeners.set(name, list)
+      return () => {
+        const at = list.indexOf(listener)
+        if (at >= 0) list.splice(at, 1)
+      }
     },
-    effect: (fn) => {
-      const disposer = fn()
-      return disposer
-    }
+    get: (name) => (name === 'webServer' ? webServer : name === 'agents' ? agents : undefined),
+    inject: (names, callback) => callback({ webServer, agents, effect: (fn) => fn() }),
+    effect: (fn) => fn()
   }
-  return { ctx, guards, server, routes }
+  return { agents, ctx, guards, routes, server }
 }
+
+// The module-level tables are shared with `apply`, so clear them before wiring the
+// fake host; the assertions below read them directly.
+policies.clear()
+parents.clear()
 
 const host = fakeHost()
 const { apply } = await import(path.join(PKG, 'src', 'index.js'))
@@ -262,7 +370,9 @@ check('apply: registers the control route', host.routes.has(ROUTE), ROUTE)
 
 await new Promise((resolve) => host.server.listen(0, '127.0.0.1', resolve))
 const base = `http://127.0.0.1:${host.server.address().port}`
-const post = (body, withHeader) =>
+const get = (sessionId) =>
+  fetch(sessionId === undefined ? `${base}${ROUTE}` : `${base}${ROUTE}?sessionId=${encodeURIComponent(sessionId)}`)
+const post = (body, withHeader = true) =>
   fetch(`${base}${ROUTE}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...(withHeader ? { [HEADER]: '1' } : {}) },
@@ -270,79 +380,111 @@ const post = (body, withHeader) =>
   })
 
 try {
+  // Two independent sessions, plus a delegated child and grandchild under the first.
+  // Spawning AFTER apply is what proves parent detection runs on live creation.
+  host.agents.spawn('root-a')
+  host.agents.spawn('root-b')
+  host.agents.spawn('child-a', 'root-a')
+  host.agents.spawn('grand-a', 'child-a')
+  check('tree: the child link was recorded', parents.get('child-a') === 'root-a', String(parents.get('child-a')))
+  check('tree: the grandchild link was recorded', parents.get('grand-a') === 'child-a', String(parents.get('grand-a')))
+  check('tree: a top-level session has no link', !parents.has('root-a'))
+
   {
-    const answer = await fetch(`${base}${ROUTE}`)
+    const answer = await get('root-a')
     const payload = await answer.json()
     check('route: GET answers ok', answer.status === 200 && payload.ok === true, String(answer.status))
     // A fresh load must change NOTHING: every switch on, i.e. every kind allowed.
     check(
       'route: GET starts with every kind allowed',
-      payload.state?.allowWrite === true && payload.state?.allowRead === true && payload.state?.allowShell === true
+      payload.state?.allowRead === true && payload.state?.allowWrite === true && payload.state?.allowShell === true
     )
+    check('route: the snapshot advertises its protocol', payload.state?.protocol === PROTOCOL, String(payload.state?.protocol))
+    check('route: the snapshot names the session', payload.state?.sessionId === 'root-a')
+    check('route: a fresh session is not inherited', payload.state?.inherited === false)
+  }
+  {
+    const answer = await get()
+    check('route: GET without a session is refused', answer.status === 400, String(answer.status))
+    check('route: the refusal names the parameter', String((await answer.json()).error).includes('sessionId'))
   }
   {
     // A cross-origin page can POST a "simple" request without a preflight; requiring
     // the custom header is what makes the browser block it.
-    const answer = await post({ allowWrite: false }, false)
+    const answer = await post({ sessionId: 'root-a', allowWrite: false }, false)
     check('route: POST without the header is refused', answer.status === 403, String(answer.status))
-    const payload = await answer.json()
-    check('route: refusal names the missing header', String(payload.error).includes(HEADER), String(payload.error))
+    check('route: refusal names the missing header', String((await answer.json()).error).includes(HEADER))
   }
   {
-    const answer = await post({ allowWrite: false }, true)
+    const answer = await post({ allowWrite: false })
+    check('route: POST without a session is refused', answer.status === 400, String(answer.status))
+  }
+  {
+    const answer = await post({ sessionId: 'root-a', allowWrite: false })
     const payload = await answer.json()
-    check('route: POST with the header flips the switch', answer.status === 200 && payload.state?.allowWrite === false)
-    check('route: POST answers the state it now holds', payload.state?.allowRead === true)
-    check('route: the snapshot carries all three switches', payload.state?.allowShell === true)
+    check('route: POST flips the switch', answer.status === 200 && payload.state?.allowWrite === false)
+    check('route: POST answers the state it now holds', payload.state?.allowRead === true && payload.state?.allowShell === true)
   }
   {
     const guard = host.guards[0]
-    const reason = guard(call('write'))
+    const reason = guard(call('write', 'root-a'))
     check('live: the guard denies immediately after the POST', typeof reason === 'string', String(reason))
     check('live: the reason is the exact user-facing wording', reason.includes('此操作已被用户实时禁用'), reason)
-    check('live: the read side is untouched', guard(call('read')) === undefined)
-    // The regression this feature exists to fix: writes off must leave the shell on.
-    check('live: the shell side is untouched by the write switch', guard(call('bash')) === undefined)
+    check('live: the read side is untouched', guard(call('read', 'root-a')) === undefined)
+    check('live: the shell side is untouched by the write switch', guard(call('bash', 'root-a')) === undefined)
   }
   {
-    const answer = await fetch(`${base}${ROUTE}`)
-    const payload = await answer.json()
-    check('route: the counter survives the round trip', payload.state?.blocked?.write === 1, String(payload.state?.blocked?.write))
-    check('route: the last denial survives the round trip', payload.state?.last?.tool === 'write')
+    // THE scoping promise, over the wire: a second session is unaffected.
+    const payload = await (await get('root-b')).json()
+    check('live: another session is untouched', payload.state?.allowWrite === true)
+    check('live: and its guard lets the write through', host.guards[0](call('write', 'root-b')) === undefined)
   }
   {
-    const answer = await post({ allowWrite: true, allowRead: false }, true)
+    // Inheritance over the wire: the child and grandchild follow the root.
+    check('live: the child inherits the restriction', typeof host.guards[0](call('write', 'child-a')) === 'string')
+    check('live: the grandchild inherits the restriction', typeof host.guards[0](call('write', 'grand-a')) === 'string')
+    const payload = await (await get('grand-a')).json()
+    check('live: an inheriting session reports its owner', payload.state?.ownerId === 'root-a', String(payload.state?.ownerId))
+    check('live: and is flagged as inherited', payload.state?.inherited === true)
+  }
+  {
+    // Editing from the child edits the ROOT: releasing there must release the whole
+    // subtree, because that is what the user means by "this session".
+    const payload = await (await post({ sessionId: 'grand-a', allowWrite: true })).json()
+    check('live: an edit from a descendant is accepted', payload.state?.allowWrite === true)
+    check('live: releasing from the descendant released the child', host.guards[0](call('write', 'child-a')) === undefined)
+    check('live: releasing from the descendant released the root', host.guards[0](call('write', 'root-a')) === undefined)
+    check('live: the other session was never involved', (await (await get('root-b')).json()).state?.allowWrite === true)
+  }
+  {
+    const answer = await post({ sessionId: 'root-a', allowShell: false, allowRead: false })
     const payload = await answer.json()
-    check('route: both switches are settable at once', payload.state?.allowWrite === true && payload.state?.allowRead === false)
+    check('route: both switches are settable at once', payload.state?.allowShell === false && payload.state?.allowRead === false)
     const guard = host.guards[0]
-    check('live: turning writes back on restores them', guard(call('write')) === undefined)
-    check('live: and blocks the reads that were just turned off', typeof guard(call('read')) === 'string')
+    check('live: the shell switch denies bash', typeof guard(call('bash', 'root-a')) === 'string')
+    check('live: the read switch denies read', typeof guard(call('read', 'root-a')) === 'string')
+    check('live: and the file tools are still allowed', guard(call('write', 'root-a')) === undefined)
   }
   {
-    // The shell switch is independent: setting it must not disturb the reads that are
-    // still off, and it must actually govern `bash`.
-    const answer = await post({ allowShell: false, allowRead: true }, true)
-    const payload = await answer.json()
-    check('route: the shell switch is settable', payload.state?.allowShell === false)
-    check('route: setting the shell does not move the reads', payload.state?.allowRead === true)
-    const guard = host.guards[0]
-    check('live: the shell switch denies bash', typeof guard(call('bash')) === 'string')
-    check('live: and leaves the file tools alone', guard(call('write')) === undefined)
-    check('live: the shell count is its own', (await (await fetch(`${base}${ROUTE}`)).json()).state?.blocked?.shell === 1)
+    const payload = await (await get('root-a')).json()
+    check('route: the counters survive the round trip', payload.state?.blocked?.shell === 1, String(payload.state?.blocked?.shell))
+    check('route: and are counted per kind', payload.state?.blocked?.read === 1, String(payload.state?.blocked?.read))
+    check('route: the last denial names its tool', payload.state?.last?.tool === 'read')
   }
   {
-    const answer = await post({ allowShell: true }, true)
-    check('route: the shell switch can be turned back on', (await answer.json()).state?.allowShell === true)
-    check('live: and bash is restored', host.guards[0](call('bash')) === undefined)
+    // Restoring every kind drops the entry entirely, so a session returns to "no
+    // policy" rather than carrying an all-true record it does not need.
+    await post({ sessionId: 'root-a', allowRead: true, allowShell: true })
+    check('route: an all-allowed session drops its policy entry', !policies.has('root-a'))
+    check('live: and its descendants are released', host.guards[0](call('read', 'grand-a')) === undefined)
   }
   {
     // A bad-typed field sitting BESIDE a good one: the good one still applies and the
     // bad one is ignored, because the request as a whole is intelligible.
-    const answer = await post({ allowWrite: 'yes', allowRead: false }, true)
-    const payload = await answer.json()
+    const payload = await (await post({ sessionId: 'root-a', allowWrite: 'yes', allowRead: false })).json()
     check('route: a bad-typed field is not coerced', payload.state?.allowWrite === true, String(payload.state?.allowWrite))
     check('route: its good sibling still applies', payload.state?.allowRead === false)
-    await post({ allowRead: true }, true)
+    await post({ sessionId: 'root-a', allowRead: true })
   }
   {
     // The mismatch case: a NEW client's field names against an OLD host. Replayed
@@ -350,25 +492,51 @@ try {
     // recognize. It must be a loud 409 rather than a silent success — silently
     // answering `ok` with unchanged state is what made a stale host look like a
     // switch that springs back on its own.
-    const answer = await post({ denyWrite: true }, true)
+    const answer = await post({ sessionId: 'root-a', denyWrite: true })
     const payload = await answer.json()
     check('route: an unrecognized payload is refused', answer.status === 409, String(answer.status))
     check('route: the refusal names the protocol', String(payload.error).includes('protocol'), String(payload.error))
     check('route: the refusal tells the user to restart', String(payload.error).includes('restart'), String(payload.error))
   }
   {
-    const snapshotPayload = await (await fetch(`${base}${ROUTE}`)).json()
-    check('route: the snapshot advertises its protocol', typeof snapshotPayload.state?.protocol === 'number', String(snapshotPayload.state?.protocol))
+    const answer = await fetch(`${base}${ROUTE}?sessionId=root-a`, { method: 'DELETE' })
+    check('route: an unsupported method is refused', answer.status === 405, String(answer.status))
   }
   {
-    const answer = await fetch(`${base}${ROUTE}`, { method: 'DELETE' })
-    check('route: an unsupported method is refused', answer.status === 405, String(answer.status))
+    // Disposal forgets the LINK but keeps the POLICY: the restriction is a user
+    // decision about a session, while a finished child should not linger in the walk.
+    await post({ sessionId: 'root-a', allowWrite: false })
+    check('teardown: the child is restricted before disposal', typeof host.guards[0](call('write', 'child-a')) === 'string')
+    host.agents.dispose('child-a')
+    check('teardown: the link is forgotten', !parents.has('child-a'))
+    check('teardown: the policy survives', policies.has('root-a'))
+    check('teardown: the root is still restricted', typeof host.guards[0](call('write', 'root-a')) === 'string')
   }
 } finally {
   await new Promise((resolve) => host.server.close(resolve))
 }
 
-// --- 6. the client half's wiring ----------------------------------------------
+// --- 6. module-level helpers --------------------------------------------------
+{
+  policies.clear()
+  parents.clear()
+  check('owner: an unrestricted session owns itself', ownerOf('solo') === 'solo')
+  policies.set('p', record({ allowWrite: false }))
+  parents.set('c', 'p')
+  check('owner: a child resolves to its restricted parent', ownerOf('c') === 'p')
+  check('policyFor: the child gets the parent policy', policyFor('c').allowWrite === false)
+  check('policyFor: an unrelated session gets the default', policyFor('x').allowWrite === true)
+  const snap = snapshot('c')
+  check('snapshot: names the asking session', snap.sessionId === 'c')
+  check('snapshot: names the owning session', snap.ownerId === 'p')
+  check('snapshot: flags inheritance', snap.inherited === true)
+  check('snapshot: carries the protocol', snap.protocol === PROTOCOL)
+  check('snapshot: an unrestricted session reports the default', snapshot('free').allowWrite === ALLOWED.allowWrite)
+  policies.clear()
+  parents.clear()
+}
+
+// --- 7. the client half's wiring ----------------------------------------------
 check('client: uses the documented list-slot id field', clientSource.includes(`id: ID`), 'id, not key')
 check('client: the slot is conversation.input.right', clientSource.includes("const SLOT = 'conversation.input.right'"))
 check('client: the slot id is its own', clientSource.includes("const ID = 'tool-guard'"))
@@ -382,7 +550,16 @@ check(
   'client: renders all three switches',
   ['allowRead', 'allowWrite', 'allowShell'].every((field) => clientSource.includes(`toggle('${field}')`))
 )
-// Copy the user asked to remove. Each one is asserted as a NEGATIVE so a later edit
+// Scoping: every request must name the session, or the Host would edit a
+// process-wide policy instead of this conversation's.
+check('client: takes the slot sessionId seat', /\{\s*t: seat,\s*sessionId\s*\}/.test(clientSource))
+check('client: sends the session on GET', clientSource.includes('?sessionId='))
+check('client: sends the session on POST', clientSource.includes('...patch, sessionId'))
+check('client: does not hardcode a session id', !/sessionId:\s*['"]/.test(clientSource))
+// The inherited notice: editing a subagent's switch edits its parent, so the menu
+// has to say so rather than let that read as an unrelated session changing.
+check('client: surfaces an inherited policy', clientSource.includes("t('inherited')"))
+// Copy the user asked to remove. Each is asserted as a NEGATIVE so a later edit
 // cannot quietly bring it back and re-widen the menu.
 check('client: no trigger label text', !clientSource.includes("t('trigger')"))
 check('client: the icon-only trigger keeps an accessible name', clientSource.includes("'aria-label': t('title')"))
@@ -391,16 +568,10 @@ check('client: no not-governed paragraph', !/notGoverned/.test(clientSource))
 check('client: no last-blocked line', !clientSource.includes("t('last'"))
 check('client: no blocked-count readout', !/blockedRead|blockedWrite|blockedShell/.test(clientSource))
 check(
-  'client: every t() key exists in both dictionaries',
-  (() => {
-    const keys = new Set([...clientSource.matchAll(/\bt\('(\w+)'/g)].map((m) => m[1]))
-    // The dictionaries are the object literals passed to locale.register.
-    const used = [...keys].filter((key) => !['tool'].includes(key))
-    return used.every((key) => {
-      const zh = new RegExp(`\\n\\s+${key}:`).test(clientSource)
-      return zh
-    })
-  })(),
+  'client: every t() key exists in a dictionary',
+  [...new Set([...clientSource.matchAll(/\bt\('(\w+)'/g)].map((m) => m[1]))].every((key) =>
+    new RegExp(`\\n\\s+${key}:`).test(clientSource)
+  ),
   [...new Set([...clientSource.matchAll(/\bt\('(\w+)'/g)].map((m) => m[1]))].join(', ')
 )
 

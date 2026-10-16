@@ -77,7 +77,7 @@ window.__ModuleLoader__.load({
      * `denyRead`, ignores the unknown field and answers with unchanged state.
      * Comparing versions turns that silent bounce into a stated cause.
      */
-    const PROTOCOL = 3
+    const PROTOCOL = 4
     /** Menu geometry: fixed width so the open position can be computed before layout. */
     const MENU_WIDTH = 288
     const MENU_GAP = 6
@@ -116,7 +116,12 @@ window.__ModuleLoader__.load({
       // Shown when the page and the running host half disagree about the protocol.
       // Not a transient failure: no amount of retrying fixes it, so the copy names
       // the one action that does.
-      staleHost: '宿主端还是旧版本，开关改动不会生效。请重启 DSH。'
+      staleHost: '宿主端还是旧版本，开关改动不会生效。请重启 DSH。',
+      // Shown when this session inherits its restriction from a parent session. The
+      // switches stay operable — editing them edits the parent's policy, which is what
+      // the user means by "this session" — but the row has to SAY that, or releasing a
+      // restriction from a subagent would look like it should not affect the parent.
+      inherited: '继承自主会话，改动同时作用于该主会话及其全部子会话'
     }
     const EN = {
       title: 'Tool guard',
@@ -130,7 +135,8 @@ window.__ModuleLoader__.load({
       failed: 'Could not read state: ',
       retry: 'Retry',
       saveFailed: 'The switch was not saved: ',
-      staleHost: 'The Host half is an older revision, so switch changes cannot take effect. Restart DSH.'
+      staleHost: 'The Host half is an older revision, so switch changes cannot take effect. Restart DSH.',
+      inherited: 'Inherited from the parent session; changes apply to it and all of its sub-sessions'
     }
 
     /** The copy for the active language, as a plain dictionary. */
@@ -175,8 +181,8 @@ window.__ModuleLoader__.load({
      * as a broken switch. See `PROTOCOL` above for the failure it prevents.
      * @returns the answer's `state` object.
      */
-    async function call(ctx, init) {
-      const response = await fetch(ROUTE, { cache: 'no-store', ...init })
+    async function call(ctx, init, url = ROUTE) {
+      const response = await fetch(url, { cache: 'no-store', ...init })
       let payload
       try {
         payload = await response.json()
@@ -199,16 +205,27 @@ window.__ModuleLoader__.load({
       return payload.state
     }
 
-    /** Read the live switch. */
-    const readState = (ctx) => call(ctx, { method: 'GET' })
+    /**
+     * Read one session's switch.
+     *
+     * The session is a QUERY PARAMETER, not a body: this is a GET, and the route is
+     * per-session now. Encoding it keeps a session id from being read as a path or
+     * being truncated at a character that means something in a URL.
+     */
+    const readState = (ctx, sessionId) =>
+      call(ctx, { method: 'GET' }, `${ROUTE}?sessionId=${encodeURIComponent(sessionId)}`)
 
-    /** Flip one or both switches; the Host answers the state it now holds. */
-    const writeState = (ctx, patch) =>
-      call(ctx, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json', [HEADER]: '1' },
-        body: JSON.stringify(patch)
-      })
+    /** Flip one or more switches; the Host answers the state it now holds. */
+    const writeState = (ctx, sessionId, patch) =>
+      call(
+        ctx,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', [HEADER]: '1' },
+          body: JSON.stringify({ ...patch, sessionId })
+        },
+        ROUTE
+      )
 
     // --- styles -----------------------------------------------------------------
     // The trigger copies the shipped chips beside it (`.trigger` in ui-model-selection
@@ -480,12 +497,18 @@ window.__ModuleLoader__.load({
      * @returns the slot component.
      */
     function makeToolGuard(ctx) {
-      return function ToolGuard({ t: seat }) {
+      return function ToolGuard({ t: seat, sessionId }) {
         // Two seats reach this prop, and both must work. With a locale face installed
         // the renderer supplies `t(key, params)`; without one, `inject` below supplies
         // the dictionary itself. Normalizing here keeps a single `t(key, params)` shape
         // everywhere in the component instead of a `typeof` check at every label.
         const t = typeof seat === 'function' ? seat : translateWith(seat ?? copyFor(ctx))
+        // The slot's own `sessionId` seat names the conversation this control sits in.
+        // Every request carries it, so the Host edits precisely that session's policy
+        // instead of a process-wide one. Guarded rather than assumed: a render without
+        // it must not turn into a request for session "undefined", which the Host would
+        // rightly refuse — it degrades to a stated error instead.
+        const activeSession = typeof sessionId === 'string' && sessionId.length > 0 ? sessionId : undefined
         const [open, setOpen] = useState(false)
         // undefined until the first read answers, so the menu can show the loading
         // line rather than rendering three switches as off.
@@ -521,8 +544,13 @@ window.__ModuleLoader__.load({
         // restart on every tick instead of simply running.
         const dataRef = useRef(undefined)
         const load = useCallback((quiet) => {
+          if (activeSession === undefined) {
+            setError('this slot carries no session id')
+            setStatus('error')
+            return
+          }
           if (!quiet) setStatus('loading')
-          readState(ctx)
+          readState(ctx, activeSession)
             .then((next) => {
               if (!liveRef.current) return
               dataRef.current = next
@@ -549,7 +577,7 @@ window.__ModuleLoader__.load({
               setError(String(failure?.message ?? failure))
               setStatus('error')
             })
-        }, [ctx])
+        }, [ctx, activeSession])
 
         const openMenu = useCallback(() => {
           const rect = triggerRef.current?.getBoundingClientRect()
@@ -570,6 +598,7 @@ window.__ModuleLoader__.load({
         /** Flip one side. Optimistic, because the guard is already live in the Host. */
         const toggle = useCallback(
           (field) => {
+            if (activeSession === undefined) return
             // `!== false` matches how the row is rendered (`readOn` etc.): an absent
             // field reads as "allowed", so flipping it must compute its inverse from
             // the same reading or the first click would appear to do nothing.
@@ -579,7 +608,7 @@ window.__ModuleLoader__.load({
             // refusal puts it back and says why, rather than leaving a lie on screen.
             setData((prev) => (prev === undefined ? prev : { ...prev, ...patch }))
             setPending(field)
-            writeState(ctx, patch)
+            writeState(ctx, activeSession, patch)
               .then((next) => {
                 if (!liveRef.current) return
                 // Keep the ref the poll's failure path reads in step with the state,
@@ -607,7 +636,7 @@ window.__ModuleLoader__.load({
                 if (liveRef.current) setPending(undefined)
               })
           },
-          [ctx, data, t]
+          [ctx, activeSession, data, t]
         )
 
         // Poll only while the menu is open, and never while a write is in flight —
@@ -673,6 +702,16 @@ window.__ModuleLoader__.load({
                     { className: 'dsh-tool-guard-header' },
                     h('div', { className: 'dsh-tool-guard-title' }, t('title'))
                   ),
+                  // A subagent's switch state comes from its parent, and editing it here
+                  // edits the parent's policy. Saying so is what keeps that from looking
+                  // like an unrelated session being changed behind the user's back.
+                  data?.inherited === true
+                    ? h(
+                        'div',
+                        { className: 'dsh-tool-guard-status' },
+                        h('span', { className: 'dsh-tool-guard-note' }, t('inherited'))
+                      )
+                    : null,
                   // A protocol mismatch hides the switches entirely rather than showing
                   // them as inert. An operable-looking switch that cannot take effect is
                   // exactly the trap this notice exists to end: the user clicks, the row
