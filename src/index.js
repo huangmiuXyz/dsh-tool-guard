@@ -93,20 +93,26 @@ const HEADER = 'x-dsh-tool-guard'
 const PROTOCOL = 5
 
 /**
- * Tools that change files, and so are refused while writes are disabled.
+ * Tools that change state through the Harness itself, and so are refused while
+ * writes are disabled.
+ *
+ * ONLY TOOLS THE HARNESS ITSELF REGISTERS BELONG HERE. A third-party plugin's tool
+ * is named by that plugin, not by this one: `import_chat`, for instance, belongs to
+ * `dsh-chat-import` and is absent from DSH entirely (it appears nowhere in the
+ * shipped app). Hard-coding such a name would mean this plugin asserting a
+ * classification for a package it cannot see, and it would silently stop matching
+ * the moment that plugin renames a tool, changes its injection mode, or the user
+ * uninstalls it. Deployments that install extra tools extend the tables through the
+ * `DSH_TOOL_GUARD_*` environment variables instead — those are explicit, live in
+ * the deployment's own configuration, and are the documented seam for exactly this.
  *
  * `subagent`/`workflow`/`send_message` are NOT here: they change no file. They are
- * governed by the `agent` switch instead, which is a different question. `todo_write`
- * / `create_goal` are NOT governed at all: they only move the agent's own
- * bookkeeping and touching them would interrupt work without protecting anything.
+ * governed by the `agent` switch instead, which is a different question.
+ * `todo_write` / `create_goal` are NOT governed at all: they only move the agent's
+ * own bookkeeping and touching them would interrupt work without protecting
+ * anything.
  */
-const WRITE_TOOLS = new Set([
-  'write',
-  'edit',
-  'plugin_manager',
-  'present',
-  'import_chat'
-])
+const WRITE_TOOLS = new Set(['write', 'edit', 'plugin_manager', 'present'])
 
 /**
  * Tools that touch ANOTHER agent — creating one, driving one, or observing the

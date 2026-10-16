@@ -154,6 +154,23 @@ for (const left of names) {
 }
 check('classify: the built-in lists are disjoint', overlaps.length === 0, overlaps.join(', '))
 
+// The tables describe tools the HARNESS registers. A third-party plugin's tool name
+// does not belong here: this plugin cannot see that package's registration, so the
+// entry would silently stop matching when it renames, re-injects, or is uninstalled.
+// import_chat was exactly that (it belongs to dsh-chat-import and appears nowhere in
+// the shipped app) and was removed. Named here as a NEGATIVE so it cannot return.
+const THIRD_PARTY_TOOL_NAMES = ['import_chat']
+check(
+  'classify: no third-party tool name is hard-coded',
+  THIRD_PARTY_TOOL_NAMES.every((name) => {
+    const all = [READ_TOOLS, WRITE_TOOLS, SHELL_TOOLS, AGENT_TOOLS]
+    return all.every((set) => !set.has(name))
+  }),
+  THIRD_PARTY_TOOL_NAMES.filter((name) =>
+    [READ_TOOLS, WRITE_TOOLS, SHELL_TOOLS, AGENT_TOOLS].some((set) => set.has(name))
+  ).join(', ')
+)
+
 // --- 3. the guard, per session + inheritance ----------------------------------
 /** A policy record as the host stores it. */
 const record = (patch = {}) => ({

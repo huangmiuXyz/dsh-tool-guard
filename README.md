@@ -34,7 +34,7 @@ continue with what the user allows, or tell the user what you need.
 | 开关 | 关掉后拦住的工具 |
 | --- | --- |
 | **读操作** | `read` `glob` `grep` `read_image` `web_search` `web_fetch` `job_output` `job_list` `get_goal` `skill` `cordis_inspect_*` `load_workspace_dependencies` |
-| **写操作** | `write` `edit` `plugin_manager` `present` `import_chat` |
+| **写操作** | `write` `edit` `plugin_manager` `present` |
 | **命令行** | `bash` `pwsh` |
 | **子智能体** | `subagent` `subagent_fork` `workflow` `send_message` `list_agents` `interrupt_agent` |
 | **不归管** | 其余一切，包括 `todo_write`、`create_goal`、以及 MCP 与第三方插件的工具 |
@@ -80,9 +80,15 @@ continue with what the user allows, or tell the user what you need.
   `cat` 可以藏重定向，而"放 shell 过去"会让开关失去意义。
 - **`todo_write` / `create_goal` 不归管。** 它们只动 agent 自己的记账，拦住只会打断工作。
 
-**未知工具不归管**是刻意的：猜"写"会误伤无害工具，猜"读"会放过真正的写操作。要覆盖
-MCP / 第三方工具，用宿主环境变量追加（逗号分隔），它**优先于**内置表，所以也能把
-`bash` 挪到别类去：
+### 内置表只写官方工具
+
+**这张表里只列 DSH 自己注册的工具。** 第三方插件（`dsh-chat-import`、`dsh-workbuddy-connect`
+等等）提供的工具不写进来，原因是插件名由那个插件拥有而不是本插件：本插件看不到它的注册，
+它改个工具名、改个注入模式、或者用户卸掉它，硬编码的那条就会静默失配。所以早前 `import_chat`
+那一项已经移除——它属于 `dsh-chat-import`，在官方包里一次都没出现过。
+
+要覆盖额外工具，用宿主环境变量追加（逗号分隔）。它**优先于**内置表，所以也能把 `bash`
+挪到别类去：
 
 ```bash
 DSH_TOOL_GUARD_READ=mcp__fs__read
